@@ -142,3 +142,7 @@ Calculates straight-line distance between GPS coordinates in kilometers.
 ## License
 
 Internal use only.
+
+## Screenshot
+
+![SMR Route Optimizer](Assets/smr-route-optimizer.png)
