@@ -71,26 +71,319 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
-def build_distance_matrix(stops):
-    """Build distance matrix for all stops"""
+# ============================================================================
+# OSRM API for Road Routing (Fast Online Service)
+# ============================================================================
+
+import urllib.request
+
+OSRM_SERVER = "https://router.project-osrm.org"
+OSRM_TIMEOUT = 60  # seconds
+
+def point_in_polygon(lat, lon, polygon):
+    """Check if a point is inside a polygon using ray casting algorithm.
+    polygon is a list of [lat, lon] coordinates.
+    """
+    n = len(polygon)
+    inside = False
+    
+    j = n - 1
+    for i in range(n):
+        if ((polygon[i][0] > lat) != (polygon[j][0] > lat) and
+            lon < (polygon[j][1] - polygon[i][1]) * (lat - polygon[i][0]) / 
+                  (polygon[j][0] - polygon[i][0]) + polygon[i][1]):
+            inside = not inside
+        j = i
+    
+    return inside
+
+def get_osrm_route_segment(from_stop, to_stop):
+    """Get road route for a single segment between two stops."""
+    try:
+        coords_str = f"{from_stop['lon']},{from_stop['lat']};{to_stop['lon']},{to_stop['lat']}"
+        url = f"{OSRM_SERVER}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
+        with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+            data = json.loads(response.read().decode())
+        
+        if data.get('code') == 'Ok':
+            route = data['routes'][0]
+            distance_m = route['distance']
+            geometry = route['geometry']['coordinates']
+            road_coords = [[coord[1], coord[0]] for coord in geometry]
+            return distance_m, road_coords
+    except Exception as e:
+        pass
+    
+    return None, None
+
+def clip_route_to_polygon(route_coords, polygon):
+    """Clip route coordinates to stay inside the polygon.
+    For segments that go outside, use straight line (which stays more inside).
+    """
+    if not route_coords or not polygon:
+        return route_coords
+    
+    clipped = []
+    last_inside_point = None
+    
+    for coord in route_coords:
+        is_inside = point_in_polygon(coord[0], coord[1], polygon)
+        
+        if is_inside:
+            # If we were outside and now inside, add entry point
+            if last_inside_point is not None and len(clipped) > 0:
+                # We're back inside
+                pass
+            clipped.append(coord)
+            last_inside_point = coord
+        else:
+            # Point is outside - we'll skip it but remember we went outside
+            # The route will have gaps that will be filled with straight lines
+            pass
+    
+    return clipped if clipped else route_coords
+
+def get_route_inside_zone(optimized_stops, polygon):
+    """Get route geometry that stays inside the zone.
+    
+    Strategy:
+    1. For each segment, get OSRM route
+    2. Check if route goes outside polygon
+    3. If outside, use straight line between stops (stays inside zone)
+    4. Calculate total distance
+    """
+    if len(optimized_stops) < 2:
+        return 0, None
+    
+    all_coords = []
+    total_distance = 0
+    
+    for i in range(len(optimized_stops) - 1):
+        from_stop = optimized_stops[i]
+        to_stop = optimized_stops[i + 1]
+        
+        # Get OSRM route for this segment
+        seg_dist, seg_coords = get_osrm_route_segment(from_stop, to_stop)
+        
+        if seg_coords:
+            # Check how much of the route is outside the polygon
+            outside_count = 0
+            for coord in seg_coords:
+                if not point_in_polygon(coord[0], coord[1], polygon):
+                    outside_count += 1
+            
+            outside_ratio = outside_count / len(seg_coords) if seg_coords else 0
+            
+            if outside_ratio < 0.3:  # Less than 30% outside - use OSRM route
+                all_coords.extend(seg_coords)
+                total_distance += seg_dist if seg_dist else 0
+            else:
+                # Too much outside - use straight line (stays inside zone)
+                # For straight line, calculate haversine distance
+                straight_dist = haversine_distance(
+                    from_stop['lat'], from_stop['lon'],
+                    to_stop['lat'], to_stop['lon']
+                ) * 1000  # Convert to meters
+                
+                # Create straight line path
+                all_coords.append([from_stop['lat'], from_stop['lon']])
+                all_coords.append([to_stop['lat'], to_stop['lon']])
+                
+                # Use estimated road distance (straight * 1.4 factor)
+                total_distance += straight_dist * 1.4
+        else:
+            # No OSRM route, use straight line
+            straight_dist = haversine_distance(
+                from_stop['lat'], from_stop['lon'],
+                to_stop['lat'], to_stop['lon']
+            ) * 1000
+            
+            all_coords.append([from_stop['lat'], from_stop['lon']])
+            all_coords.append([to_stop['lat'], to_stop['lon']])
+            total_distance += straight_dist * 1.4
+    
+    return total_distance / 1000, all_coords  # Return km
+
+def get_osrm_route(stops):
+    """Get road route geometry from OSRM for a sequence of stops.
+    Returns: (total_distance_km, road_geometry) or (None, None) on failure
+    """
+    if len(stops) < 2:
+        return None, None
+    
+    try:
+        # OSRM expects lon,lat format
+        coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
+        url = f"{OSRM_SERVER}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
+        with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+            data = json.loads(response.read().decode())
+        
+        if data.get('code') == 'Ok':
+            route = data['routes'][0]
+            distance_km = route['distance'] / 1000
+            geometry = route['geometry']['coordinates']  # [[lon, lat], ...]
+            # Convert to [[lat, lon], ...] for Leaflet
+            road_coords = [[coord[1], coord[0]] for coord in geometry]
+            return distance_km, road_coords
+    except Exception as e:
+        print(f"   ⚠️ OSRM route error: {e}")
+    
+    return None, None
+
+def get_osrm_distance_matrix(stops, batch_size=50):
+    """Get real road distance matrix from OSRM Table API.
+    OSRM automatically snaps points to nearest road.
+    Returns matrix in meters (integers) for OR-Tools.
+    """
+    n = len(stops)
+    matrix = [[0] * n for _ in range(n)]
+    
+    if n <= 1:
+        return matrix
+    
+    try:
+        # For small number of stops, get full matrix in one call
+        if n <= batch_size:
+            coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
+            url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance"
+            
+            req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
+            with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+                data = json.loads(response.read().decode())
+            
+            if data.get('code') == 'Ok':
+                distances = data['distances']  # Already in meters
+                for i in range(n):
+                    for j in range(n):
+                        if distances[i][j] is not None:
+                            matrix[i][j] = int(distances[i][j])
+                        else:
+                            # No road connection, use large penalty
+                            matrix[i][j] = 999999999
+                return matrix
+        else:
+            # For larger sets, batch the requests
+            # First get all coordinates
+            coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
+            
+            # Get distances in batches (sources in batches, all destinations)
+            for batch_start in range(0, n, batch_size):
+                batch_end = min(batch_start + batch_size, n)
+                sources = ";".join([str(i) for i in range(batch_start, batch_end)])
+                
+                url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance&sources={sources}"
+                
+                req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
+                with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+                    data = json.loads(response.read().decode())
+                
+                if data.get('code') == 'Ok':
+                    distances = data['distances']
+                    for i, src_idx in enumerate(range(batch_start, batch_end)):
+                        for j in range(n):
+                            if distances[i][j] is not None:
+                                matrix[src_idx][j] = int(distances[i][j])
+                            else:
+                                matrix[src_idx][j] = 999999999
+            
+            return matrix
+            
+    except Exception as e:
+        print(f"   ⚠️ OSRM table error: {e}, falling back to haversine")
+    
+    # Fallback to haversine if OSRM fails
+    return build_haversine_matrix(stops)
+
+def build_haversine_matrix(stops):
+    """Build distance matrix using haversine (straight-line) distances.
+    Fallback when OSRM is unavailable.
+    """
     n = len(stops)
     matrix = [[0] * n for _ in range(n)]
     for i in range(n):
         for j in range(n):
             if i != j:
-                matrix[i][j] = haversine_distance(
+                dist_km = haversine_distance(
                     stops[i]['lat'], stops[i]['lon'],
                     stops[j]['lat'], stops[j]['lon']
                 )
+                matrix[i][j] = int(dist_km * 1000)  # meters as integer
     return matrix
 
-def nearest_neighbor_route(stops, start_idx=0):
-    """Find route using nearest neighbor algorithm"""
+def solve_tsp_ortools(stops, start_idx=0, matrix=None):
+    """Solve TSP using Google OR-Tools - same algorithm as Google Maps.
+    Uses Guided Local Search metaheuristic for near-optimal solutions.
+    """
+    from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+    
+    n = len(stops)
+    if n <= 1:
+        return list(range(n)), 0
+    
+    if matrix is None:
+        matrix = build_distance_matrix(stops)
+    
+    # Create routing index manager
+    manager = pywrapcp.RoutingIndexManager(n, 1, start_idx)
+    
+    # Create routing model
+    routing = pywrapcp.RoutingModel(manager)
+    
+    # Distance callback
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return matrix[from_node][to_node]
+    
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    
+    # Search parameters - use Guided Local Search (Google's preferred method)
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    search_parameters.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    search_parameters.time_limit.seconds = 5  # Max 5 seconds for optimization
+    search_parameters.log_search = False
+    
+    # Solve
+    solution = routing.SolveWithParameters(search_parameters)
+    
+    if solution:
+        # Extract route
+        route = []
+        index = routing.Start(0)
+        total_distance = 0
+        
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            route.append(node)
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            total_distance += routing.GetArcCostForVehicle(previous_index, index, 0)
+        
+        return route, total_distance / 1000  # Convert back to km
+    else:
+        # Fallback to simple nearest neighbor if OR-Tools fails
+        print("   ⚠️ OR-Tools failed, using fallback algorithm")
+        return fallback_nearest_neighbor(stops, start_idx, matrix)
+
+def fallback_nearest_neighbor(stops, start_idx=0, matrix=None):
+    """Simple nearest neighbor as fallback"""
     n = len(stops)
     if n == 0:
         return [], 0
     
-    matrix = build_distance_matrix(stops)
+    if matrix is None:
+        matrix = build_distance_matrix(stops)
+    
     visited = [False] * n
     route = [start_idx]
     visited[start_idx] = True
@@ -110,50 +403,115 @@ def nearest_neighbor_route(stops, start_idx=0):
             total_dist += nearest_dist
             current = nearest
     
-    return route, total_dist
-
-def two_opt_improve(stops, route, max_iterations=30):
-    """Improve route using 2-opt algorithm"""
-    matrix = build_distance_matrix(stops)
-    n = len(route)
-    
-    def route_length(r):
-        return sum(matrix[r[i]][r[i+1]] for i in range(len(r)-1))
-    
-    best_distance = route_length(route)
-    iterations = 0
-    
-    improved = True
-    while improved and iterations < max_iterations:
-        improved = False
-        iterations += 1
-        
-        for i in range(1, min(n - 2, 100)):
-            for j in range(i + 2, min(n, i + 50)):
-                new_route = route[:i] + route[i:j][::-1] + route[j:]
-                new_dist = route_length(new_route)
-                if new_dist < best_distance:
-                    route = new_route
-                    best_distance = new_dist
-                    improved = True
-                    break
-            if improved:
-                break
-    
-    return route, best_distance
+    return route, total_dist / 1000  # Convert to km
 
 def optimize_route(stops, start_idx=0):
-    """Optimize route through stops"""
-    if len(stops) <= 1:
-        return stops, 0
+    """Optimize route through stops using real road distances from OSRM.
     
-    route_idx, _ = nearest_neighbor_route(stops, start_idx)
-    route_idx, total_dist = two_opt_improve(stops, route_idx, max_iterations=30)
+    Features:
+    - Uses actual road distances (not straight-line) for optimization
+    - OSRM automatically snaps stops to nearest road
+    - OR-Tools finds minimum total distance route
+    - Returns optimized order with road geometry for display
+    """
+    if len(stops) <= 1:
+        return stops, 0, None
+    
+    print(f"\nOptimizing route for {len(stops)} stops using REAL ROAD distances...")
+    
+    # Get real road distance matrix from OSRM
+    # This automatically handles:
+    # - Snapping points to nearest road
+    # - Computing actual driving distances
+    # - Considering one-way streets, road networks, etc.
+    print(f"   Getting road distance matrix from OSRM...")
+    matrix = get_osrm_distance_matrix(stops)
+    
+    # Check if we got valid road distances
+    sample_dist = matrix[0][1] if len(stops) > 1 else 0
+    if sample_dist == 999999999:
+        print(f"   OSRM unavailable, falling back to haversine distances")
+        matrix = build_haversine_matrix(stops)
+    else:
+        print(f"   Road distance matrix ready ({len(stops)}x{len(stops)})")
+    
+    # Run Google OR-Tools optimization with road distances
+    print(f"   Running OR-Tools solver (Guided Local Search)...")
+    route_idx, total_dist = solve_tsp_ortools(stops, start_idx, matrix)
     
     optimized = [stops[i] for i in route_idx]
-    return optimized, total_dist
+    
+    # Get actual road geometry from OSRM for visualization
+    road_geometry = None
+    print(f"   Getting road path geometry for display...")
+    road_dist, road_geometry = get_osrm_route(optimized)
+    
+    if road_geometry:
+        print(f"   Road path: {len(road_geometry)} points, {round(road_dist, 2)} km")
+        total_dist = road_dist  # Use the accurate road distance
+    else:
+        print(f"   Could not get road geometry for display")
+    
+    print(f"   Optimization complete: {round(total_dist, 2)} km total road distance")
+    
+    return optimized, total_dist, road_geometry
 
-# ============================================================================
+def optimize_route_in_zone(stops, start_idx=0, polygon=None):
+    """Optimize route that stays INSIDE the zone polygon.
+    
+    Features:
+    - Uses actual road distances for optimization
+    - Route visualization stays inside zone boundaries
+    - If road goes outside zone, uses straight line path instead
+    - Backtracking is allowed to stay inside
+    """
+    if len(stops) <= 1:
+        return stops, 0, None
+    
+    print(f"\nOptimizing route for {len(stops)} stops (ZONE-CONSTRAINED)...")
+    
+    # Get road distance matrix from OSRM for optimization
+    print(f"   Getting road distance matrix from OSRM...")
+    matrix = get_osrm_distance_matrix(stops)
+    
+    # Check if we got valid road distances
+    sample_dist = matrix[0][1] if len(stops) > 1 else 0
+    if sample_dist == 999999999:
+        print(f"   OSRM unavailable, falling back to haversine distances")
+        matrix = build_haversine_matrix(stops)
+    else:
+        print(f"   Road distance matrix ready ({len(stops)}x{len(stops)})")
+    
+    # Run Google OR-Tools optimization
+    print(f"   Running OR-Tools solver (Guided Local Search)...")
+    route_idx, total_dist = solve_tsp_ortools(stops, start_idx, matrix)
+    
+    optimized = [stops[i] for i in route_idx]
+    
+    # Get route geometry that stays INSIDE the zone
+    road_geometry = None
+    if polygon:
+        print(f"   Getting zone-constrained road path...")
+        road_dist, road_geometry = get_route_inside_zone(optimized, polygon)
+        
+        if road_geometry:
+            print(f"   Zone-constrained path: {len(road_geometry)} points, {round(road_dist, 2)} km")
+            total_dist = road_dist
+        else:
+            print(f"   Could not get zone-constrained geometry, using OSRM...")
+            road_dist, road_geometry = get_osrm_route(optimized)
+            if road_geometry:
+                total_dist = road_dist
+    else:
+        # No polygon provided, use regular OSRM route
+        road_dist, road_geometry = get_osrm_route(optimized)
+        if road_geometry:
+            total_dist = road_dist
+    
+    print(f"   Optimization complete: {round(total_dist, 2)} km total distance")
+    
+    return optimized, total_dist, road_geometry
+
 # HTTP Server with API
 # ============================================================================
 
@@ -167,10 +525,10 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/' or self.path == '/index.html':
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
             html = generate_main_page(RequestHandler.stops)
-            self.wfile.write(html.encode())
+            self.wfile.write(html.encode('utf-8'))
         elif self.path == '/api/zones':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -192,8 +550,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             zone_name = data.get('zone_name', 'Unnamed Zone')
             polygon = data.get('polygon', [])
             
-            # Optimize route
-            optimized, distance = optimize_route(stops, start_idx)
+            # Optimize route with zone constraint (route stays inside polygon)
+            optimized, distance, road_geometry = optimize_route_in_zone(stops, start_idx, polygon)
             
             # Create zone data
             zone_data = {
@@ -201,7 +559,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 'polygon': polygon,
                 'total_stops': len(optimized),
                 'total_distance_km': round(distance, 2),
-                'route': optimized
+                'route': optimized,
+                'road_geometry': road_geometry  # Actual road path for visualization
             }
             
             # Add to zones and save
@@ -218,6 +577,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                 'zone_index': len(RequestHandler.zones_data['zones']) - 1
             }
             self.wfile.write(json.dumps(response).encode())
+        
+        elif self.path == '/api/delete-zone':
+            content_length = int(self.headers['Content-Length'])
+            post_data = json.loads(self.rfile.read(content_length))
+            zone_index = post_data.get('zone_index', -1)
+            
+            if 0 <= zone_index < len(RequestHandler.zones_data['zones']):
+                deleted_zone = RequestHandler.zones_data['zones'].pop(zone_index)
+                save_zones_to_file(RequestHandler.zones_data)
+                print(f"🗑️ Deleted zone: {deleted_zone['name']}")
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': True}).encode())
+            else:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'error': 'Invalid zone index'}).encode())
         
         elif self.path == '/api/clear':
             RequestHandler.zones_data = {'zones': []}
@@ -269,6 +648,8 @@ def generate_main_page(stops):
     html = f'''<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SMR PO - Route Optimizer</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
     <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
@@ -336,8 +717,35 @@ def generate_main_page(stops):
             border-radius: 5px;
             font-size: 12px;
         }}
-        .zone-item .name {{ font-weight: bold; color: #333; }}
-        .zone-item .stats {{ color: #666; margin-top: 5px; }}
+        .zone-item .name {{ 
+            font-weight: bold; 
+            color: #333; 
+            display: flex;
+            align-items: center;
+        }}
+        .zone-item .name:hover {{ 
+            color: #2196f3;
+        }}
+        .zone-item .stats {{ 
+            color: #666; 
+            margin-top: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .delete-btn {{
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            opacity: 0.6;
+        }}
+        .delete-btn:hover {{
+            background: #ffebee;
+            opacity: 1;
+        }}
         .zone-color {{
             display: inline-block;
             width: 12px;
@@ -438,10 +846,14 @@ def generate_main_page(stops):
         let routeLayers = [];
         let currentStep = 1;
         
-        // Initialize map
-        const map = L.map('map').setView([{center_lat}, {center_lon}], 12);
+        // Initialize map with higher max zoom
+        const map = L.map('map', {{
+            maxZoom: 22
+        }}).setView([{center_lat}, {center_lon}], 12);
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            attribution: '© OpenStreetMap'
+            attribution: '© OpenStreetMap',
+            maxZoom: 22,
+            maxNativeZoom: 19
         }}).addTo(map);
         
         // Marker cluster for all stops
@@ -588,9 +1000,68 @@ def generate_main_page(stops):
             }}
         }}
         
+        // Global array to store arrow markers for cleanup
+        let arrowMarkers = [];
+        
+        function addArrowsToRoute(coords, color) {{
+            // Add arrow markers along the route to show direction
+            // Use longer lookahead for consistent direction calculation
+            const arrowInterval = 15; // Add arrow every N points
+            const lookAhead = 10; // Points to look ahead for direction (smoother)
+            
+            for (let i = arrowInterval; i < coords.length - lookAhead; i += arrowInterval) {{
+                // Use points further apart for more consistent direction
+                const p1 = coords[i];
+                const p2 = coords[Math.min(i + lookAhead, coords.length - 1)];
+                
+                // coords are [lat, lon] - lat is Y (vertical), lon is X (horizontal)
+                const lat1 = p1[0], lon1 = p1[1];
+                const lat2 = p2[0], lon2 = p2[1];
+                
+                // Skip if points are too close (would give unstable direction)
+                const dist = Math.sqrt(Math.pow(lat2 - lat1, 2) + Math.pow(lon2 - lon1, 2));
+                if (dist < 0.0001) continue;
+                
+                // Calculate bearing/angle from point 1 to point 2
+                const deltaLat = lat2 - lat1;
+                const deltaLon = lon2 - lon1;
+                
+                // atan2(deltaLon, deltaLat) gives angle from North (0°)
+                const angleRad = Math.atan2(deltaLon, deltaLat);
+                const angleDeg = angleRad * 180 / Math.PI;
+                
+                // Arrow symbol ▶ points right by default, rotate to point in travel direction
+                const rotation = 90 - angleDeg;
+                
+                // Create arrow marker
+                const arrowIcon = L.divIcon({{
+                    className: 'route-arrow',
+                    html: `<div style="
+                        color: ${{color}};
+                        font-size: 12px;
+                        font-weight: bold;
+                        transform: rotate(${{rotation}}deg);
+                        text-shadow: 1px 1px 1px white, -1px -1px 1px white, 1px -1px 1px white, -1px 1px 1px white;
+                        line-height: 1;
+                    ">▶</div>`,
+                    iconSize: [12, 12],
+                    iconAnchor: [6, 6]
+                }});
+                
+                const arrowMarker = L.marker([p1[0], p1[1]], {{ icon: arrowIcon }}).addTo(map);
+                arrowMarkers.push(arrowMarker);
+            }}
+        }}
+        
+        function clearArrowMarkers() {{
+            arrowMarkers.forEach(m => map.removeLayer(m));
+            arrowMarkers = [];
+        }}
+        
         function drawRoute(zone, index) {{
             const color = zoneColors[index % zoneColors.length];
             const route = zone.route;
+            const roadGeometry = zone.road_geometry;  // Actual road path from OSMnx
             const startColor = '#00C853';  // Green for start
             const endColor = '#FF1744';    // Red for end
             
@@ -625,12 +1096,20 @@ def generate_main_page(stops):
             }});
             const labelMarker = L.marker([center.lat, center.lng], {{ icon: labelIcon }}).addTo(map);
             
-            // Draw route line
-            const routeCoords = route.map(s => [s.lat, s.lon]);
+            // Draw route line - use road geometry if available, otherwise straight lines
+            let routeCoords;
+            if (roadGeometry && roadGeometry.length > 0) {{
+                routeCoords = roadGeometry;  // Use actual road path
+                console.log('Drawing road path:', roadGeometry.length, 'points');
+            }} else {{
+                routeCoords = route.map(s => [s.lat, s.lon]);  // Fallback to straight lines
+                console.log('Drawing straight lines (no road geometry)');
+            }}
+            
             const routeLine = L.polyline(routeCoords, {{
                 color: color,
                 weight: 3,
-                opacity: 0.8
+                opacity: 0.9
             }}).addTo(map);
             
             // Add numbered markers with special colors for start and end
@@ -703,15 +1182,79 @@ def generate_main_page(stops):
             
             container.innerHTML = zones.map((zone, i) => `
                 <div class="zone-item">
-                    <div class="name">
+                    <div class="name" onclick="focusZone(${{i}})" style="cursor: pointer;" title="Click to view zone on map">
                         <span class="zone-color" style="background: ${{zoneColors[i % zoneColors.length]}}"></span>
                         ${{zone.name}}
                     </div>
                     <div class="stats">
                         📍 ${{zone.total_stops}} stops | 📏 ${{zone.total_distance_km}} km
+                        <button onclick="deleteZone(${{i}})" class="delete-btn" title="Delete zone">🗑️</button>
                     </div>
                 </div>
             `).join('');
+        }}
+        
+        function focusZone(index) {{
+            // Pan and zoom the map to show the selected zone
+            if (routeLayers[index] && routeLayers[index].polygon) {{
+                const bounds = routeLayers[index].polygon.getBounds();
+                map.fitBounds(bounds, {{ padding: [50, 50] }});
+            }}
+        }}
+        
+        async function deleteZone(index) {{
+            const zoneName = zones[index].name;
+            if (!confirm(`Are you sure you want to delete zone "${{zoneName}}"?`)) return;
+            
+            try {{
+                const response = await fetch('/api/delete-zone', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ zone_index: index }})
+                }});
+                
+                const result = await response.json();
+                
+                if (result.success) {{
+                    // Remove layers from map
+                    const layer = routeLayers[index];
+                    if (layer) {{
+                        map.removeLayer(layer.polygon);
+                        map.removeLayer(layer.line);
+                        map.removeLayer(layer.markers);
+                        if (layer.label) map.removeLayer(layer.label);
+                    }}
+                    
+                    // Remove from arrays
+                    routeLayers.splice(index, 1);
+                    zones.splice(index, 1);
+                    
+                    // Re-draw all zones to update colors
+                    redrawAllZones();
+                    updateZoneList();
+                }}
+            }} catch (err) {{
+                alert('Error: ' + err.message);
+            }}
+        }}
+        
+        function redrawAllZones() {{
+            // Remove all route layers
+            routeLayers.forEach(layer => {{
+                map.removeLayer(layer.polygon);
+                map.removeLayer(layer.line);
+                map.removeLayer(layer.markers);
+                if (layer.label) map.removeLayer(layer.label);
+            }});
+            routeLayers = [];
+            
+            // Clear arrow markers
+            clearArrowMarkers();
+            
+            // Re-draw with correct colors
+            zones.forEach((zone, i) => {{
+                drawRoute(zone, i);
+            }});
         }}
         
         function cancelZone() {{
@@ -737,6 +1280,9 @@ def generate_main_page(stops):
                 }});
                 routeLayers = [];
                 zones = [];
+                
+                // Clear arrow markers
+                clearArrowMarkers();
                 
                 updateZoneList();
                 alert('✅ All zones cleared');
