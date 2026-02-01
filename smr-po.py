@@ -16,6 +16,8 @@ from math import radians, sin, cos, sqrt, atan2
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import urllib.parse
+import numpy as np
+from sklearn.cluster import KMeans
 
 # Configuration
 DATA_FILE = 'product_sense_public_shops_with_area.json'
@@ -512,6 +514,233 @@ def optimize_route_in_zone(stops, start_idx=0, polygon=None):
     
     return optimized, total_dist, road_geometry
 
+# ============================================================================
+# Auto Zone Creation with KMeans
+# ============================================================================
+
+# Zone size constraints
+MIN_ZONE_SIZE = 100
+MAX_ZONE_SIZE = 130
+
+def calculate_optimal_zones(total_stops):
+    """
+    Calculate the optimal number of zones based on 100-130 stops per zone rule.
+    Returns (min_zones, max_zones, suggested_zones)
+    """
+    if total_stops < MIN_ZONE_SIZE:
+        return None, None, None
+    
+    min_zones = max(1, -(-total_stops // MAX_ZONE_SIZE))  # ceil division
+    max_zones = total_stops // MIN_ZONE_SIZE
+    
+    # Suggested is the middle ground
+    avg_target = (MIN_ZONE_SIZE + MAX_ZONE_SIZE) // 2  # 115
+    suggested = max(min_zones, min(max_zones, round(total_stops / avg_target)))
+    
+    return min_zones, max_zones, suggested
+
+def auto_create_zones_kmeans(stops, num_zones=None):
+    """
+    Automatically create zones using KMeans clustering.
+    Ensures each zone has 100-130 stops (points are geographically close).
+    
+    Args:
+        stops: List of stops inside the big polygon
+        num_zones: Number of zones (if None, auto-calculated)
+    
+    Returns:
+        List of zone dictionaries with polygon, stops, and metadata
+    """
+    total_stops = len(stops)
+    
+    # Calculate valid zone range
+    min_zones, max_zones, suggested = calculate_optimal_zones(total_stops)
+    
+    if min_zones is None:
+        print(f"   ❌ Not enough stops. Need at least {MIN_ZONE_SIZE} stops.")
+        return None
+    
+    # Auto-calculate if not provided
+    if num_zones is None:
+        num_zones = suggested
+    
+    # Validate num_zones is within valid range
+    if num_zones < min_zones or num_zones > max_zones:
+        print(f"   ❌ Invalid zone count. For {total_stops} stops, need {min_zones}-{max_zones} zones.")
+        return None
+    
+    print(f"\n🤖 Auto-creating {num_zones} zones using KMeans clustering...")
+    print(f"   Total stops: {total_stops}")
+    print(f"   Rule: {MIN_ZONE_SIZE}-{MAX_ZONE_SIZE} stops per zone")
+    print(f"   Valid zone range: {min_zones}-{max_zones} zones")
+    
+    # Prepare data for KMeans (lat, lon coordinates)
+    coordinates = np.array([[s['lat'], s['lon']] for s in stops])
+    
+    # Run KMeans clustering
+    kmeans = KMeans(n_clusters=num_zones, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(coordinates)
+    centers = kmeans.cluster_centers_
+    
+    # Group stops by cluster
+    clusters = [[] for _ in range(num_zones)]
+    for i, label in enumerate(labels):
+        clusters[label].append(i)
+    
+    # Rebalance clusters to ensure 100-130 stops each
+    print(f"   Rebalancing clusters to {MIN_ZONE_SIZE}-{MAX_ZONE_SIZE} range...")
+    clusters = rebalance_clusters(stops, clusters, centers, coordinates)
+    
+    # Create zones
+    auto_zones = []
+    
+    for cluster_id, cluster_indices in enumerate(clusters):
+        if len(cluster_indices) == 0:
+            continue
+        
+        cluster_stops = [stops[i] for i in cluster_indices]
+        print(f"   Zone {cluster_id + 1}: {len(cluster_stops)} stops")
+        
+        # Create convex hull polygon around cluster points
+        cluster_coords = [(s['lat'], s['lon']) for s in cluster_stops]
+        cluster_polygon = create_convex_hull(cluster_coords)
+        
+        # Create zone data
+        zone = {
+            'name': f'Zone {cluster_id + 1}',
+            'polygon': cluster_polygon,
+            'stops': cluster_stops,
+            'total_stops': len(cluster_stops)
+        }
+        
+        auto_zones.append(zone)
+    
+    print(f"   ✅ Created {len(auto_zones)} zones successfully")
+    
+    return auto_zones
+
+def rebalance_clusters(stops, clusters, centers, coordinates):
+    """
+    Rebalance clusters to ensure each has 100-130 stops.
+    Moves points from oversized clusters to undersized neighbors.
+    """
+    max_iterations = 50
+    
+    for iteration in range(max_iterations):
+        # Check if all clusters are within range
+        all_valid = True
+        for cluster in clusters:
+            if len(cluster) < MIN_ZONE_SIZE or len(cluster) > MAX_ZONE_SIZE:
+                all_valid = False
+                break
+        
+        if all_valid:
+            break
+        
+        # Find oversized and undersized clusters
+        oversized = [(i, len(c)) for i, c in enumerate(clusters) if len(c) > MAX_ZONE_SIZE]
+        undersized = [(i, len(c)) for i, c in enumerate(clusters) if len(c) < MIN_ZONE_SIZE]
+        
+        if not oversized and not undersized:
+            break
+        
+        # Move points from oversized to undersized clusters
+        for over_idx, over_size in sorted(oversized, key=lambda x: -x[1]):
+            if len(clusters[over_idx]) <= MAX_ZONE_SIZE:
+                continue
+            
+            # Find nearest undersized cluster
+            best_under_idx = None
+            best_dist = float('inf')
+            
+            for under_idx, under_size in undersized:
+                if len(clusters[under_idx]) >= MIN_ZONE_SIZE:
+                    continue
+                dist = haversine_distance(
+                    centers[over_idx][0], centers[over_idx][1],
+                    centers[under_idx][0], centers[under_idx][1]
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_under_idx = under_idx
+            
+            if best_under_idx is None:
+                # No undersized cluster, find any cluster that can accept
+                for i, c in enumerate(clusters):
+                    if i != over_idx and len(c) < MAX_ZONE_SIZE:
+                        dist = haversine_distance(
+                            centers[over_idx][0], centers[over_idx][1],
+                            centers[i][0], centers[i][1]
+                        )
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_under_idx = i
+            
+            if best_under_idx is not None:
+                # Find point in oversized cluster closest to undersized center
+                target_center = centers[best_under_idx]
+                best_point_idx = None
+                best_point_dist = float('inf')
+                
+                for point_idx in clusters[over_idx]:
+                    dist = haversine_distance(
+                        coordinates[point_idx][0], coordinates[point_idx][1],
+                        target_center[0], target_center[1]
+                    )
+                    if dist < best_point_dist:
+                        best_point_dist = dist
+                        best_point_idx = point_idx
+                
+                if best_point_idx is not None:
+                    clusters[over_idx].remove(best_point_idx)
+                    clusters[best_under_idx].append(best_point_idx)
+        
+        # Update centers
+        for i, cluster in enumerate(clusters):
+            if len(cluster) > 0:
+                centers[i] = np.mean([coordinates[j] for j in cluster], axis=0)
+    
+    return clusters
+
+def create_convex_hull(points):
+    """Create convex hull polygon from points using Graham scan algorithm"""
+    if len(points) < 3:
+        return list(points)
+    
+    # Find the bottom-most point (lowest lat)
+    points = list(set(points))  # Remove duplicates
+    if len(points) < 3:
+        return points
+    
+    points = sorted(points, key=lambda p: (p[0], p[1]))
+    start = points[0]
+    
+    # Sort points by polar angle with respect to start point
+    def polar_angle(p):
+        y_diff = p[0] - start[0]
+        x_diff = p[1] - start[1]
+        return (atan2(y_diff, x_diff), x_diff**2 + y_diff**2)
+    
+    sorted_points = sorted(points[1:], key=polar_angle)
+    
+    if len(sorted_points) < 2:
+        return points
+    
+    # Graham scan
+    hull = [start, sorted_points[0]]
+    
+    for p in sorted_points[1:]:
+        while len(hull) > 1:
+            # Cross product to check if we turn left or right
+            h1, h2 = hull[-2], hull[-1]
+            cross = (h2[1] - h1[1]) * (p[0] - h2[0]) - (h2[0] - h1[0]) * (p[1] - h2[1])
+            if cross > 0:
+                break
+            hull.pop()
+        hull.append(p)
+    
+    return hull
+
 # HTTP Server with API
 # ============================================================================
 
@@ -577,6 +806,102 @@ class RequestHandler(BaseHTTPRequestHandler):
                 'zone_index': len(RequestHandler.zones_data['zones']) - 1
             }
             self.wfile.write(json.dumps(response).encode())
+        
+        elif self.path == '/api/auto-create-zones':
+            content_length = int(self.headers['Content-Length'])
+            post_data = json.loads(self.rfile.read(content_length))
+            
+            stops = post_data['stops']
+            num_zones = post_data.get('num_zones')
+            
+            # Calculate valid zone range
+            total_stops = len(stops)
+            min_zones, max_zones, suggested = calculate_optimal_zones(total_stops)
+            
+            if min_zones is None:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'error': f'Not enough stops. Need at least {MIN_ZONE_SIZE} stops. You have {total_stops}.'
+                }).encode())
+                return
+            
+            # Validate num_zones
+            if num_zones is not None:
+                if num_zones < min_zones or num_zones > max_zones:
+                    self.send_response(400)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        'success': False,
+                        'error': f'Invalid zone count! For {total_stops} stops with {MIN_ZONE_SIZE}-{MAX_ZONE_SIZE} per zone, you need {min_zones}-{max_zones} zones.',
+                        'min_zones': min_zones,
+                        'max_zones': max_zones,
+                        'suggested': suggested
+                    }).encode())
+                    return
+            else:
+                num_zones = suggested
+            
+            # Generate zones using KMeans
+            auto_zones = auto_create_zones_kmeans(stops, num_zones)
+            
+            if auto_zones:
+                # Optimize route for each zone
+                for zone in auto_zones:
+                    print(f"   🚗 Optimizing route for {zone['name']}...")
+                    optimized, distance, road_geometry = optimize_route_in_zone(
+                        zone['stops'], 0, zone['polygon']
+                    )
+                    zone['route'] = optimized
+                    zone['total_distance_km'] = round(distance, 2)
+                    zone['road_geometry'] = road_geometry
+                    
+                    # Add to zones data
+                    RequestHandler.zones_data['zones'].append(zone)
+                
+                save_zones_to_file(RequestHandler.zones_data)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': True,
+                    'zones_created': len(auto_zones),
+                    'zones': auto_zones
+                }).encode())
+            else:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'success': False,
+                    'error': 'Not enough stops for zones'
+                }).encode())
+        
+        elif self.path == '/api/rename-zone':
+            content_length = int(self.headers['Content-Length'])
+            post_data = json.loads(self.rfile.read(content_length))
+            zone_index = post_data.get('zone_index', -1)
+            new_name = post_data.get('new_name', '').strip()
+            
+            if 0 <= zone_index < len(RequestHandler.zones_data['zones']) and new_name:
+                old_name = RequestHandler.zones_data['zones'][zone_index]['name']
+                RequestHandler.zones_data['zones'][zone_index]['name'] = new_name
+                save_zones_to_file(RequestHandler.zones_data)
+                print(f"✏️ Renamed zone: {old_name} → {new_name}")
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': True, 'new_name': new_name}).encode())
+            else:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'error': 'Invalid zone index or empty name'}).encode())
         
         elif self.path == '/api/delete-zone':
             content_length = int(self.headers['Content-Length'])
@@ -733,7 +1058,7 @@ def generate_main_page(stops):
             justify-content: space-between;
             align-items: center;
         }}
-        .delete-btn {{
+        .delete-btn, .rename-btn {{
             background: none;
             border: none;
             cursor: pointer;
@@ -741,10 +1066,25 @@ def generate_main_page(stops):
             padding: 2px 6px;
             border-radius: 3px;
             opacity: 0.6;
+            width: auto;
         }}
         .delete-btn:hover {{
             background: #ffebee;
             opacity: 1;
+        }}
+        .rename-btn:hover {{
+            background: #e3f2fd;
+            opacity: 1;
+        }}
+        .zone-name-input {{
+            width: calc(100% - 60px) !important;
+            padding: 5px !important;
+            margin: 0 !important;
+            font-size: 12px !important;
+        }}
+        .zone-actions {{
+            display: flex;
+            gap: 2px;
         }}
         .zone-color {{
             display: inline-block;
@@ -800,23 +1140,42 @@ def generate_main_page(stops):
         
         <div class="panel hidden" id="zoneSetup">
             <h3>📝 Zone Setup</h3>
-            <label>Zone Name:</label>
-            <input type="text" id="zoneName" placeholder="Enter zone name...">
             
-            <label>Start Point:</label>
-            <select id="startDropdown">
-                <option value="">-- Draw zone first --</option>
-            </select>
-            
-            <p style="font-size: 12px; color: #666;">
+            <p style="font-size: 12px; color: #666; margin-bottom: 10px;">
                 🎯 Stops in zone: <span id="selectedCount">0</span>
             </p>
             
-            <button class="btn-primary" id="calcBtn" disabled onclick="calculateRoute()">
-                🚗 Calculate Optimized Route
-            </button>
+            <!-- Auto-Zone Section -->
+            <div id="autoZoneSection" style="margin-bottom: 15px; padding: 12px; background: linear-gradient(135deg, #fff3e0, #ffe0b2); border-radius: 8px; border: 2px solid #ff9800;">
+                <label style="font-weight: bold; color: #e65100; font-size: 14px;">🤖 Auto Create Zones (KMeans AI)</label>
+                <p style="font-size: 11px; color: #666; margin: 5px 0;">Each zone will have <b>100-130</b> closest stops</p>
+                <div id="zoneRangeInfo" style="font-size: 12px; color: #1565c0; margin: 8px 0; padding: 5px; background: #e3f2fd; border-radius: 4px;"></div>
+                <input type="number" id="numZones" placeholder="Number of zones" min="1" max="50" style="margin-top: 5px;">
+                <button class="btn-primary" onclick="autoCreateZones()" style="margin-top: 8px; background: #ff9800;">
+                    ⚡ Auto Generate Zones
+                </button>
+            </div>
             
-            <button class="btn-secondary" onclick="cancelZone()">
+            <hr style="margin: 15px 0; border: none; border-top: 2px dashed #ddd;">
+            
+            <!-- Manual Zone Section -->
+            <div style="padding: 10px; background: #e3f2fd; border-radius: 8px;">
+                <label style="font-weight: bold; color: #1565c0;">📝 Or Create Single Zone Manually</label>
+                
+                <label style="margin-top: 10px;">Zone Name:</label>
+                <input type="text" id="zoneName" placeholder="Enter zone name...">
+                
+                <label>Start Point:</label>
+                <select id="startDropdown">
+                    <option value="">-- Select start point --</option>
+                </select>
+                
+                <button class="btn-primary" id="calcBtn" disabled onclick="calculateRoute()" style="margin-top: 10px;">
+                    🚗 Calculate Optimized Route
+                </button>
+            </div>
+            
+            <button class="btn-secondary" onclick="cancelZone()" style="margin-top: 10px;">
                 ❌ Cancel
             </button>
         </div>
@@ -900,6 +1259,10 @@ def generate_main_page(stops):
                 populateDropdown();
                 document.getElementById('zoneSetup').classList.remove('hidden');
                 document.getElementById('zoneName').value = '';
+                
+                // Calculate and show valid zone range
+                updateZoneRangeInfo(selectedStops.length);
+                
                 document.getElementById('zoneName').focus();
                 setStep(2);
             }} else {{
@@ -1181,24 +1544,144 @@ def generate_main_page(stops):
             }}
             
             container.innerHTML = zones.map((zone, i) => `
-                <div class="zone-item">
-                    <div class="name" onclick="focusZone(${{i}})" style="cursor: pointer;" title="Click to view zone on map">
+                <div class="zone-item" id="zone-item-${{i}}">
+                    <div class="name" id="zone-name-${{i}}" onclick="focusZone(${{i}})" style="cursor: pointer;" title="Click to view zone on map">
                         <span class="zone-color" style="background: ${{zoneColors[i % zoneColors.length]}}"></span>
-                        ${{zone.name}}
+                        <span id="zone-name-text-${{i}}">${{zone.name}}</span>
                     </div>
                     <div class="stats">
                         📍 ${{zone.total_stops}} stops | 📏 ${{zone.total_distance_km}} km
-                        <button onclick="deleteZone(${{i}})" class="delete-btn" title="Delete zone">🗑️</button>
+                        <div class="zone-actions">
+                            <button onclick="event.stopPropagation(); startRenameZone(${{i}})" class="rename-btn" title="Rename zone">✏️</button>
+                            <button onclick="event.stopPropagation(); deleteZone(${{i}})" class="delete-btn" title="Delete zone">🗑️</button>
+                        </div>
                     </div>
                 </div>
             `).join('');
         }}
+        
+        // Track if we're currently saving (to prevent blur cancel)
+        let isSaving = false;
         
         function focusZone(index) {{
             // Pan and zoom the map to show the selected zone
             if (routeLayers[index] && routeLayers[index].polygon) {{
                 const bounds = routeLayers[index].polygon.getBounds();
                 map.fitBounds(bounds, {{ padding: [50, 50] }});
+            }}
+        }}
+        
+        function startRenameZone(index) {{
+            event.stopPropagation();  // Prevent focusZone from triggering
+            
+            const nameContainer = document.getElementById(`zone-name-${{index}}`);
+            const currentName = zones[index].name;
+            
+            // Replace with input field
+            nameContainer.innerHTML = `
+                <input type="text" class="zone-name-input" id="rename-input-${{index}}" value="${{currentName}}">
+                <button id="save-btn-${{index}}" style="background:#4CAF50;color:white;padding:3px 8px;border:none;border-radius:3px;cursor:pointer;font-size:11px;width:auto;margin-left:5px;">\u2713</button>
+            `;
+            
+            const input = document.getElementById(`rename-input-${{index}}`);
+            const saveBtn = document.getElementById(`save-btn-${{index}}`);
+            
+            // Focus and select the input
+            input.focus();
+            input.select();
+            
+            // Handle Enter key
+            input.onkeypress = function(e) {{
+                if (e.key === 'Enter') {{
+                    e.preventDefault();
+                    saveRenameZone(index, currentName);
+                }}
+            }};
+            
+            // Handle Escape key to cancel
+            input.onkeydown = function(e) {{
+                if (e.key === 'Escape') {{
+                    cancelRenameZone(index, currentName);
+                }}
+            }};
+            
+            // Save button click
+            saveBtn.onmousedown = function(e) {{
+                e.preventDefault();  // Prevent blur from firing
+                isSaving = true;
+            }};
+            saveBtn.onclick = function(e) {{
+                e.stopPropagation();
+                saveRenameZone(index, currentName);
+            }};
+            
+            // Handle blur (click outside)
+            input.onblur = function(e) {{
+                setTimeout(() => {{
+                    if (!isSaving) {{
+                        cancelRenameZone(index, currentName);
+                    }}
+                    isSaving = false;
+                }}, 150);
+            }};
+        }}
+        
+        async function saveRenameZone(index, originalName) {{
+            const input = document.getElementById(`rename-input-${{index}}`);
+            if (!input) return;
+            
+            const newName = input.value.trim();
+            if (!newName) {{
+                alert('Zone name cannot be empty');
+                cancelRenameZone(index, originalName);
+                return;
+            }}
+            
+            if (newName === originalName) {{
+                cancelRenameZone(index, originalName);
+                return;
+            }}
+            
+            try {{
+                const response = await fetch('/api/rename-zone', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ zone_index: index, new_name: newName }})
+                }});
+                
+                const result = await response.json();
+                
+                if (result.success) {{
+                    // Update local zone data
+                    zones[index].name = newName;
+                    
+                    // Update sidebar list
+                    updateZoneList();
+                    
+                    // Update map labels by redrawing
+                    redrawAllZones();
+                    
+                    console.log('Zone renamed successfully:', newName);
+                }} else {{
+                    alert('Failed to rename zone: ' + (result.error || 'Unknown error'));
+                    cancelRenameZone(index, originalName);
+                }}
+            }} catch (err) {{
+                alert('Error: ' + err.message);
+                cancelRenameZone(index, originalName);
+            }}
+            
+            isSaving = false;
+        }}
+        
+        function cancelRenameZone(index, originalName) {{
+            const nameContainer = document.getElementById(`zone-name-${{index}}`);
+            if (nameContainer) {{
+                const color = zoneColors[index % zoneColors.length];
+                nameContainer.innerHTML = `
+                    <span class="zone-color" style="background: ${{color}}"></span>
+                    <span id="zone-name-text-${{index}}">${{originalName}}</span>
+                `;
             }}
         }}
         
@@ -1288,6 +1771,107 @@ def generate_main_page(stops):
                 alert('✅ All zones cleared');
             }} catch (err) {{
                 alert('Error: ' + err.message);
+            }}
+        }}
+        
+        function updateZoneRangeInfo(totalStops) {{
+            const minZoneSize = 100;
+            const maxZoneSize = 130;
+            const infoDiv = document.getElementById('zoneRangeInfo');
+            
+            if (totalStops < minZoneSize) {{
+                infoDiv.innerHTML = `⚠️ Need at least <b>100</b> stops. You have <b>${{totalStops}}</b>.`;
+                infoDiv.style.background = '#ffebee';
+                infoDiv.style.color = '#c62828';
+                document.getElementById('numZones').disabled = true;
+                return;
+            }}
+            
+            const minZones = Math.ceil(totalStops / maxZoneSize);
+            const maxZones = Math.floor(totalStops / minZoneSize);
+            const suggested = Math.round(totalStops / 115);
+            
+            infoDiv.innerHTML = `📊 <b>${{totalStops}}</b> stops → Valid: <b>${{minZones}}-${{maxZones}}</b> zones (suggested: <b>${{suggested}}</b>)`;
+            infoDiv.style.background = '#e3f2fd';
+            infoDiv.style.color = '#1565c0';
+            document.getElementById('numZones').disabled = false;
+            document.getElementById('numZones').min = minZones;
+            document.getElementById('numZones').max = maxZones;
+            document.getElementById('numZones').value = suggested;
+            document.getElementById('numZones').placeholder = `${{minZones}}-${{maxZones}} zones`;
+        }}
+        
+        async function autoCreateZones() {{
+            const totalStops = selectedStops.length;
+            const minZoneSize = 100;
+            const maxZoneSize = 130;
+            
+            if (totalStops < minZoneSize) {{
+                alert(`⚠️ Not enough stops!\n\nYou need at least 100 stops.\nCurrently selected: ${{totalStops}} stops`);
+                return;
+            }}
+            
+            const minZones = Math.ceil(totalStops / maxZoneSize);
+            const maxZones = Math.floor(totalStops / minZoneSize);
+            const numZones = parseInt(document.getElementById('numZones').value);
+            
+            if (!numZones || numZones < minZones || numZones > maxZones) {{
+                alert(`⚠️ Invalid zone count!\n\nFor ${{totalStops}} stops with 100-130 per zone:\n• Minimum zones: ${{minZones}}\n• Maximum zones: ${{maxZones}}\n\nPlease enter a value between ${{minZones}} and ${{maxZones}}.`);
+                return;
+            }}
+            
+            const avgPerZone = Math.round(totalStops / numZones);
+            if (!confirm(`🤖 Auto-create ${{numZones}} zones using AI clustering?\n\n📊 Stats:\n• Total stops: ${{totalStops}}\n• Average per zone: ~${{avgPerZone}} stops\n• Each zone: 100-130 stops (guaranteed)\n\nThis will optimize routes for all zones automatically.`)) {{
+                return;
+            }}
+            
+            // Show loading
+            document.getElementById('loading').textContent = `🤖 AI creating ${{numZones}} zones...\nThis may take a few minutes.`;
+            document.getElementById('loading').style.display = 'block';
+            
+            try {{
+                const response = await fetch('/api/auto-create-zones', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{
+                        stops: selectedStops,
+                        num_zones: numZones
+                    }})
+                }});
+                
+                const result = await response.json();
+                
+                if (result.success) {{
+                    // Add zones to list
+                    result.zones.forEach(zone => {{
+                        zones.push(zone);
+                    }});
+                    
+                    // Draw all new zones
+                    redrawAllZones();
+                    updateZoneList();
+                    
+                    // Clear temp polygon and hide setup
+                    drawnItems.clearLayers();
+                    currentPolygon = null;
+                    selectedStops = [];
+                    document.getElementById('zoneSetup').classList.add('hidden');
+                    setStep(1);
+                    
+                    // Show summary
+                    let summary = `✅ Created ${{result.zones_created}} zones automatically!\n\n`;
+                    result.zones.forEach((z, i) => {{
+                        summary += `${{z.name}}: ${{z.total_stops}} stops, ${{z.total_distance_km}} km\n`;
+                    }});
+                    alert(summary);
+                }} else {{
+                    alert('❌ Error: ' + result.error);
+                }}
+            }} catch (err) {{
+                alert('❌ Error: ' + err.message);
+            }} finally {{
+                document.getElementById('loading').textContent = '⏳ Optimizing route...';
+                document.getElementById('loading').style.display = 'none';
             }}
         }}
         
