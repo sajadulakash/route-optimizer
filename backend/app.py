@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from math import atan2, cos, radians, sin, sqrt
@@ -96,6 +97,10 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 # Google Maps API Configuration
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+GOOGLE_MAPS_BROWSER_API_KEY = os.environ.get(
+    "GOOGLE_MAPS_BROWSER_API_KEY",
+    GOOGLE_MAPS_API_KEY,
+)
 GOOGLE_MAPS_TIMEOUT = int(os.environ.get("GOOGLE_MAPS_TIMEOUT", "60"))
 
 # Cache directory for API responses
@@ -1376,7 +1381,7 @@ def render_index(stops):
     ).replace('</', '<\\/')
     return (template
             .replace('__SMR_BOOTSTRAP__', bootstrap_json)
-            .replace('__TOTAL_STOPS__', str(len(stops))))
+            .replace('__TOTAL_STOPS__', str(len(stops))).replace('__GOOGLE_MAPS_BROWSER_API_KEY__', urllib.parse.quote(GOOGLE_MAPS_BROWSER_API_KEY, safe='')))
 
 
 
@@ -1627,6 +1632,8 @@ def main():
 
     if not GOOGLE_MAPS_API_KEY:
         print("   WARNING: GOOGLE_MAPS_API_KEY is not configured; using straight-line routing fallbacks")
+    if not GOOGLE_MAPS_BROWSER_API_KEY:
+        print("   WARNING: GOOGLE_MAPS_BROWSER_API_KEY is not configured; the frontend map cannot load")
 
     # Get local IP address (first non-localhost IP)
     try:

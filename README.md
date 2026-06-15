@@ -2,14 +2,14 @@
 
 SMR Route Optimizer is a Python web application for creating sales or delivery
 zones and calculating an ordered route through the shops in each zone. The
-backend exposes a JSON API and serves a separate Leaflet frontend, while zone
+backend exposes a JSON API and serves a dedicated Google Maps frontend, while zone
 data and route geometry are persisted in `zones_routes.json`.
 
 The current dataset contains 24,724 shops in the `dhk_metro` area.
 
 ## Features
 
-- OpenStreetMap and Leaflet map with clustered shop markers
+- Google Maps JavaScript frontend with native shop, zone, and route overlays
 - Polygon and rectangle selection
 - Manual zones with a selectable starting shop
 - Automatic compact zones with a configurable target stop count
@@ -32,7 +32,7 @@ The current dataset contains 24,724 shops in the `dhk_metro` area.
 - `smr-po.py` remains a compatibility launcher and calls `backend.app.main()`.
 
 The frontend has no build step. The backend injects shop data and the initial map
-center into `frontend/index.html`, then serves the CSS and JavaScript files as
+center and browser Maps API key into `frontend/index.html`, then serves the CSS and JavaScript files as
 static assets.
 
 ## Routing Behavior
@@ -101,7 +101,7 @@ Create the local environment file before the first run:
 cp .env.example .env
 ```
 
-Then edit `.env` and set `GOOGLE_MAPS_API_KEY`. The `.env` file is ignored by Git.
+Then edit `.env` and set `GOOGLE_MAPS_API_KEY`. Enable the Maps JavaScript API, Directions API, and Distance Matrix API in Google Cloud. The `.env` file is ignored by Git.
 
 ## Configuration
 
@@ -109,6 +109,8 @@ Runtime settings are loaded from environment variables and the ignored `.env` fi
 
 ```dotenv
 GOOGLE_MAPS_API_KEY=replace-with-your-google-maps-api-key
+# Recommended: use a separate HTTP-referrer-restricted browser key
+# GOOGLE_MAPS_BROWSER_API_KEY=replace-with-your-browser-restricted-key
 GOOGLE_MAPS_TIMEOUT=60
 SMR_PORT=9541
 SMR_OPEN_BROWSER=true
@@ -117,8 +119,7 @@ SMR_OPEN_BROWSER=true
 # SMR_OUTPUT_FILE=zones_routes.json
 ```
 
-Exported environment variables take precedence over values in `.env`. Restrict
-the Google Maps key to the required APIs and appropriate clients. Never commit
+Exported environment variables take precedence over values in `.env`. Use separate restricted keys in production: IP-restrict the server key and HTTP-referrer-restrict the browser key. The browser key is visible to users by design. Never commit
 the local `.env` file.
 
 ## Run
@@ -272,7 +273,8 @@ for improvement, with a five-second limit per zone.
 
 - Distance Matrix API supplies small-zone road costs.
 - Directions API supplies walking-mode route geometry.
-- Encoded polylines are decoded for Leaflet.
+- Encoded polylines are decoded and rendered as Google Maps polylines.
+- The Maps JavaScript API renders the visible map, shops, selections, zones, and routes.
 - Segment caches use SHA-1 hashes of endpoint coordinates.
 
 ### Haversine
