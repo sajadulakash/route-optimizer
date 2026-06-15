@@ -1,6 +1,9 @@
 const bootstrap = window.SMR_BOOTSTRAP;
 const allStops = bootstrap.stops;
 const zoneColors = ['#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3', '#00bcd4', '#009688', '#4caf50', '#ff9800', '#ff5722'];
+const MIN_STOP_RENDER_ZOOM = 17;
+const MAX_VISIBLE_STOPS = 600;
+
 
 let map;
 let stopLayer;
@@ -16,6 +19,8 @@ let drawingPoints = [];
 let drawingPreview = null;
 let drawingVertexMarkers = [];
 let isSaving = false;
+let stopRenderTimer = null;
+
 
 function escapeHtml(value) {
     return String(value ?? '')
@@ -82,8 +87,10 @@ window.initMap = function initMap() {
     infoWindow = new google.maps.InfoWindow();
     addStopsToMap();
     map.addListener('click', handleDrawingClick);
+    map.addListener('idle', scheduleVisibleStopRender);
     loadExistingZones();
-    setDrawingStatus('Choose Polygon or Rectangle, then draw on the map.');
+    setDrawingStatus('Zoom in or draw an area. Visible shops load by viewport.');
+    scheduleVisibleStopRender();
 };
 
 window.gm_authFailure = function gmAuthFailure() {
@@ -92,18 +99,6 @@ window.gm_authFailure = function gmAuthFailure() {
 
 function addStopsToMap() {
     stopLayer = new google.maps.Data({ map });
-
-    allStops.forEach(stop => {
-        stopLayer.add({
-            geometry: new google.maps.Data.Point(new google.maps.LatLng(stop.lat, stop.lon)),
-            properties: {
-                id: stop.id,
-                name: stop.name,
-                address: stop.address
-            }
-        });
-    });
-
     stopLayer.setStyle({
         icon: {
             path: google.maps.SymbolPath.CIRCLE,
@@ -122,6 +117,68 @@ function addStopsToMap() {
         infoWindow.setPosition(event.latLng);
         infoWindow.open({ map });
     });
+}
+
+function clearVisibleStops() {
+    if (!stopLayer) return;
+    stopLayer.forEach(feature => stopLayer.remove(feature));
+}
+
+function scheduleVisibleStopRender() {
+    window.clearTimeout(stopRenderTimer);
+    stopRenderTimer = window.setTimeout(renderVisibleStops, 120);
+}
+
+function renderVisibleStops() {
+    if (!map || !stopLayer) return;
+
+    const bounds = map.getBounds();
+    if (!bounds) return;
+
+    clearVisibleStops();
+
+    if (map.getZoom() < MIN_STOP_RENDER_ZOOM) {
+        if (!drawingMode && !currentSelectionOverlay) {
+            setDrawingStatus(`Zoom in to level ${MIN_STOP_RENDER_ZOOM}+ to display nearby shops. Drawing still selects from all ${allStops.length} shops.`);
+        }
+        return;
+    }
+
+    const southWest = bounds.getSouthWest();
+    const northEast = bounds.getNorthEast();
+    const south = southWest.lat();
+    const north = northEast.lat();
+    const west = southWest.lng();
+    const east = northEast.lng();
+    const crossesAntimeridian = west > east;
+    let inViewCount = 0;
+    let renderedCount = 0;
+
+    for (const stop of allStops) {
+        const inLat = stop.lat >= south && stop.lat <= north;
+        const inLng = crossesAntimeridian
+            ? stop.lon >= west || stop.lon <= east
+            : stop.lon >= west && stop.lon <= east;
+        if (!inLat || !inLng) continue;
+
+        inViewCount += 1;
+        if (renderedCount >= MAX_VISIBLE_STOPS) continue;
+
+        stopLayer.add({
+            geometry: new google.maps.Data.Point(new google.maps.LatLng(stop.lat, stop.lon)),
+            properties: {
+                id: stop.id,
+                name: stop.name,
+                address: stop.address
+            }
+        });
+        renderedCount += 1;
+    }
+
+    if (!drawingMode && !currentSelectionOverlay) {
+        const capped = inViewCount > renderedCount ? ` Showing first ${renderedCount}. Zoom in for more detail.` : '';
+        setDrawingStatus(`${renderedCount} of ${inViewCount} shops visible in this viewport.${capped}`);
+    }
 }
 
 function setDrawingStatus(message) {
