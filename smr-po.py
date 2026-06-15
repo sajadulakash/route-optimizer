@@ -12,6 +12,23 @@ SMR Path Optimization Tool - Single Page Application
 import json
 import re
 import os
+
+def load_environment_file(filepath):
+    """Load simple KEY=VALUE entries without overriding exported variables."""
+    if not os.path.exists(filepath):
+        return
+
+    with open(filepath, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"\x27")
+            if key:
+                os.environ.setdefault(key, value)
+
 from math import radians, sin, cos, sqrt, atan2
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
@@ -20,10 +37,13 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 # Configuration
-DATA_FILE = 'product_sense_public_shops_with_area.json'
-WORKING_DIR = '/home/sajadulakash/Desktop/SMR PO'
-OUTPUT_FILE = 'zones_routes.json'
-PORT = 9541
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_environment_file(os.path.join(BASE_DIR, ".env"))
+
+DATA_FILE = os.environ.get("SMR_DATA_FILE", "product_sense_public_shops_with_area.json")
+WORKING_DIR = os.environ.get("SMR_WORKING_DIR", BASE_DIR)
+OUTPUT_FILE = os.environ.get("SMR_OUTPUT_FILE", "zones_routes.json")
+PORT = int(os.environ.get("SMR_PORT", "9541"))
 
 # ============================================================================
 # Data Loading
@@ -74,13 +94,18 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 # ============================================================================
-# OSRM API for Road Routing (Fast Online Service)
+# Google Maps API for Road Routing
 # ============================================================================
 
 import urllib.request
+import hashlib
 
-OSRM_SERVER = "https://router.project-osrm.org"
-OSRM_TIMEOUT = 60  # seconds
+# Google Maps API Configuration
+GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+GOOGLE_MAPS_TIMEOUT = int(os.environ.get("GOOGLE_MAPS_TIMEOUT", "60"))
+
+# Cache directory for API responses
+CACHE_DIR = os.path.join(WORKING_DIR, 'cache')
 
 def point_in_polygon(lat, lon, polygon):
     """Check if a point is inside a polygon using ray casting algorithm.
@@ -99,24 +124,104 @@ def point_in_polygon(lat, lon, polygon):
     
     return inside
 
-def get_osrm_route_segment(from_stop, to_stop):
-    """Get road route for a single segment between two stops."""
+def get_cache_path(cache_key):
+    """Get cache file path for a given key."""
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    return os.path.join(CACHE_DIR, f"{cache_key}.json")
+
+def load_from_cache(cache_key):
+    """Load data from cache if exists."""
+    cache_path = get_cache_path(cache_key)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return None
+
+def save_to_cache(cache_key, data):
+    """Save data to cache."""
+    cache_path = get_cache_path(cache_key)
     try:
-        coords_str = f"{from_stop['lon']},{from_stop['lat']};{to_stop['lon']},{to_stop['lat']}"
-        url = f"{OSRM_SERVER}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+        with open(cache_path, 'w') as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def decode_polyline(polyline_str):
+    """Decode Google Maps encoded polyline to list of [lat, lon] coordinates."""
+    index, lat, lng = 0, 0, 0
+    coordinates = []
+    while index < len(polyline_str):
+        # Decode latitude
+        shift, result = 0, 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        lat += (~(result >> 1) if result & 1 else (result >> 1))
+        
+        # Decode longitude
+        shift, result = 0, 0
+        while True:
+            b = ord(polyline_str[index]) - 63
+            index += 1
+            result |= (b & 0x1f) << shift
+            shift += 5
+            if b < 0x20:
+                break
+        lng += (~(result >> 1) if result & 1 else (result >> 1))
+        
+        coordinates.append([lat / 1e5, lng / 1e5])
+    return coordinates
+
+def get_google_route_segment(from_stop, to_stop):
+    """Get road route for a single segment between two stops using Google Maps API."""
+    if not GOOGLE_MAPS_API_KEY:
+        return None, None
+
+    try:
+        # Create cache key
+        cache_key = "seg_" + hashlib.sha1(f"{from_stop['lat']},{from_stop['lon']}-{to_stop['lat']},{to_stop['lon']}".encode()).hexdigest()
+        
+        # Check cache first
+        cached = load_from_cache(cache_key)
+        if cached and cached.get('coords'):
+            return cached.get('distance'), cached.get('coords')
+        
+        origin = f"{from_stop['lat']},{from_stop['lon']}"
+        destination = f"{to_stop['lat']},{to_stop['lon']}"
+        # Use walking mode for shorter, more direct paths within zones
+        url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={destination}&mode=walking&key={GOOGLE_MAPS_API_KEY}"
         
         req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
-        with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=GOOGLE_MAPS_TIMEOUT) as response:
             data = json.loads(response.read().decode())
         
-        if data.get('code') == 'Ok':
+        if data.get('status') == 'OK':
             route = data['routes'][0]
-            distance_m = route['distance']
-            geometry = route['geometry']['coordinates']
-            road_coords = [[coord[1], coord[0]] for coord in geometry]
+            leg = route['legs'][0]
+            distance_m = leg['distance']['value']  # Distance in meters
+            
+            # Decode the polyline to get route coordinates
+            polyline = route['overview_polyline']['points']
+            road_coords = decode_polyline(polyline)
+            
+            print(f"      Segment: {len(road_coords)} points, {distance_m}m")
+            
+            # Cache the result
+            save_to_cache(cache_key, {'distance': distance_m, 'coords': road_coords})
+            
             return distance_m, road_coords
+        else:
+            print(f"   ⚠️ Google Directions API error: {data.get('status')} - {data.get('error_message', '')}")
     except Exception as e:
-        pass
+        print(f"   ⚠️ Google Maps route error: {e}")
     
     return None, None
 
@@ -151,7 +256,7 @@ def get_route_inside_zone(optimized_stops, polygon):
     """Get route geometry that stays inside the zone.
     
     Strategy:
-    1. For each segment, get OSRM route
+    1. For each segment, get Google Maps route
     2. Check if route goes outside polygon
     3. If outside, use straight line between stops (stays inside zone)
     4. Calculate total distance
@@ -166,8 +271,8 @@ def get_route_inside_zone(optimized_stops, polygon):
         from_stop = optimized_stops[i]
         to_stop = optimized_stops[i + 1]
         
-        # Get OSRM route for this segment
-        seg_dist, seg_coords = get_osrm_route_segment(from_stop, to_stop)
+        # Get Google Maps route for this segment
+        seg_dist, seg_coords = get_google_route_segment(from_stop, to_stop)
         
         if seg_coords:
             # Check how much of the route is outside the polygon
@@ -208,96 +313,183 @@ def get_route_inside_zone(optimized_stops, polygon):
     
     return total_distance / 1000, all_coords  # Return km
 
-def get_osrm_route(stops):
-    """Get road route geometry from OSRM for a sequence of stops.
+def get_google_route(stops):
+    """Get road route geometry from Google Maps for a sequence of stops.
+    Returns: (total_distance_km, road_geometry) or (None, None) on failure
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        return None, None
+
+    if len(stops) < 2:
+        return None, None
+    
+    try:
+        # Create cache key for the full route
+        stops_key = "-".join([f"{s['lat']},{s['lon']}" for s in stops])
+        cache_key = hashlib.sha1(stops_key.encode()).hexdigest()
+        
+        # Check cache first
+        cached = load_from_cache(cache_key)
+        if cached:
+            return cached.get('distance_km'), cached.get('coords')
+        
+        # Google Maps Directions API with waypoints
+        origin = f"{stops[0]['lat']},{stops[0]['lon']}"
+        destination = f"{stops[-1]['lat']},{stops[-1]['lon']}"
+        
+        # Add intermediate stops as waypoints (max 25 waypoints per request)
+        all_coords = []
+        total_distance = 0
+        
+        # Process in batches of 25 waypoints (Google Maps limit)
+        batch_size = 23  # 23 waypoints + origin + destination = 25 points
+        
+        for batch_start in range(0, len(stops) - 1, batch_size):
+            batch_end = min(batch_start + batch_size + 1, len(stops))
+            batch_stops = stops[batch_start:batch_end]
+            
+            if len(batch_stops) < 2:
+                continue
+            
+            batch_origin = f"{batch_stops[0]['lat']},{batch_stops[0]['lon']}"
+            batch_dest = f"{batch_stops[-1]['lat']},{batch_stops[-1]['lon']}"
+            
+            # Use walking mode for shorter paths within zones
+            url = f"https://maps.googleapis.com/maps/api/directions/json?origin={batch_origin}&destination={batch_dest}&mode=walking"
+            
+            # Add waypoints if more than 2 stops
+            if len(batch_stops) > 2:
+                waypoints = "|".join([f"{s['lat']},{s['lon']}" for s in batch_stops[1:-1]])
+                url += f"&waypoints={waypoints}"
+            
+            url += f"&key={GOOGLE_MAPS_API_KEY}"
+            
+            req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
+            with urllib.request.urlopen(req, timeout=GOOGLE_MAPS_TIMEOUT) as response:
+                data = json.loads(response.read().decode())
+            
+            if data.get('status') == 'OK':
+                route = data['routes'][0]
+                
+                # Sum up distances from all legs
+                for leg in route['legs']:
+                    total_distance += leg['distance']['value']
+                
+                # Decode the polyline
+                polyline = route['overview_polyline']['points']
+                batch_coords = decode_polyline(polyline)
+                all_coords.extend(batch_coords)
+        
+        if all_coords:
+            distance_km = total_distance / 1000
+            # Cache the result
+            save_to_cache(cache_key, {'distance_km': distance_km, 'coords': all_coords})
+            return distance_km, all_coords
+            
+    except Exception as e:
+        print(f"   ⚠️ Google Maps route error: {e}")
+    
+    return None, None
+
+def get_route_segments(stops):
+    """Get road route by fetching each segment individually.
+    Slower but more reliable for longer routes.
     Returns: (total_distance_km, road_geometry) or (None, None) on failure
     """
     if len(stops) < 2:
         return None, None
     
-    try:
-        # OSRM expects lon,lat format
-        coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
-        url = f"{OSRM_SERVER}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
+    all_coords = []
+    total_distance = 0
+    
+    print(f"      Fetching {len(stops)-1} segments...")
+    
+    for i in range(len(stops) - 1):
+        from_stop = stops[i]
+        to_stop = stops[i + 1]
         
-        req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
-        with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
-            data = json.loads(response.read().decode())
+        seg_dist, seg_coords = get_google_route_segment(from_stop, to_stop)
         
-        if data.get('code') == 'Ok':
-            route = data['routes'][0]
-            distance_km = route['distance'] / 1000
-            geometry = route['geometry']['coordinates']  # [[lon, lat], ...]
-            # Convert to [[lat, lon], ...] for Leaflet
-            road_coords = [[coord[1], coord[0]] for coord in geometry]
-            return distance_km, road_coords
-    except Exception as e:
-        print(f"   ⚠️ OSRM route error: {e}")
+        if seg_coords:
+            all_coords.extend(seg_coords)
+            total_distance += seg_dist if seg_dist else 0
+        else:
+            # Fallback to straight line for this segment
+            all_coords.append([from_stop['lat'], from_stop['lon']])
+            all_coords.append([to_stop['lat'], to_stop['lon']])
+            straight_dist = haversine_distance(
+                from_stop['lat'], from_stop['lon'],
+                to_stop['lat'], to_stop['lon']
+            ) * 1000
+            total_distance += straight_dist
+    
+    if all_coords:
+        return total_distance / 1000, all_coords
     
     return None, None
 
-def get_osrm_distance_matrix(stops, batch_size=50):
-    """Get real road distance matrix from OSRM Table API.
-    OSRM automatically snaps points to nearest road.
+def get_google_distance_matrix(stops, batch_size=10):
+    """Get real road distance matrix from Google Maps Distance Matrix API.
+    Google Maps automatically snaps points to nearest road.
     Returns matrix in meters (integers) for OR-Tools.
+    Note: Google limits to 25 origins or 25 destinations per request, max 100 elements.
     """
+    if not GOOGLE_MAPS_API_KEY:
+        return build_haversine_matrix(stops)
+
     n = len(stops)
     matrix = [[0] * n for _ in range(n)]
     
     if n <= 1:
         return matrix
     
+    # Create cache key for the matrix
+    stops_key = "-".join([f"{s['lat']},{s['lon']}" for s in stops])
+    cache_key = "matrix_" + hashlib.sha1(stops_key.encode()).hexdigest()
+    
+    # Check cache first
+    cached = load_from_cache(cache_key)
+    if cached:
+        return cached
+    
     try:
-        # For small number of stops, get full matrix in one call
-        if n <= batch_size:
-            coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
-            url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance"
+        # Google Distance Matrix API has limits: 25 origins x 25 destinations = 625 elements max
+        # We'll process in batches
+        
+        for i_start in range(0, n, batch_size):
+            i_end = min(i_start + batch_size, n)
+            origins = "|".join([f"{stops[i]['lat']},{stops[i]['lon']}" for i in range(i_start, i_end)])
             
-            req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
-            with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
-                data = json.loads(response.read().decode())
-            
-            if data.get('code') == 'Ok':
-                distances = data['distances']  # Already in meters
-                for i in range(n):
-                    for j in range(n):
-                        if distances[i][j] is not None:
-                            matrix[i][j] = int(distances[i][j])
-                        else:
-                            # No road connection, use large penalty
-                            matrix[i][j] = 999999999
-                return matrix
-        else:
-            # For larger sets, batch the requests
-            # First get all coordinates
-            coords_str = ";".join([f"{s['lon']},{s['lat']}" for s in stops])
-            
-            # Get distances in batches (sources in batches, all destinations)
-            for batch_start in range(0, n, batch_size):
-                batch_end = min(batch_start + batch_size, n)
-                sources = ";".join([str(i) for i in range(batch_start, batch_end)])
+            for j_start in range(0, n, batch_size):
+                j_end = min(j_start + batch_size, n)
+                destinations = "|".join([f"{stops[j]['lat']},{stops[j]['lon']}" for j in range(j_start, j_end)])
                 
-                url = f"{OSRM_SERVER}/table/v1/driving/{coords_str}?annotations=distance&sources={sources}"
+                url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins}&destinations={destinations}&key={GOOGLE_MAPS_API_KEY}"
                 
                 req = urllib.request.Request(url, headers={'User-Agent': 'RouteOptimizer/1.0'})
-                with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT) as response:
+                with urllib.request.urlopen(req, timeout=GOOGLE_MAPS_TIMEOUT) as response:
                     data = json.loads(response.read().decode())
                 
-                if data.get('code') == 'Ok':
-                    distances = data['distances']
-                    for i, src_idx in enumerate(range(batch_start, batch_end)):
-                        for j in range(n):
-                            if distances[i][j] is not None:
-                                matrix[src_idx][j] = int(distances[i][j])
+                if data.get('status') == 'OK':
+                    rows = data['rows']
+                    for i_idx, row in enumerate(rows):
+                        for j_idx, element in enumerate(row['elements']):
+                            if element.get('status') == 'OK':
+                                matrix[i_start + i_idx][j_start + j_idx] = element['distance']['value']
                             else:
-                                matrix[src_idx][j] = 999999999
-            
-            return matrix
+                                # No road connection, use large penalty
+                                matrix[i_start + i_idx][j_start + j_idx] = 999999999
+                else:
+                    print(f"   ⚠️ Google Distance Matrix error: {data.get('status')}")
+        
+        # Cache the result
+        save_to_cache(cache_key, matrix)
+        return matrix
             
     except Exception as e:
-        print(f"   ⚠️ OSRM table error: {e}, falling back to haversine")
+        print(f"   ⚠️ Google Distance Matrix error: {e}, falling back to haversine")
     
-    # Fallback to haversine if OSRM fails
+    # Fallback to haversine if Google Maps fails
     return build_haversine_matrix(stops)
 
 def build_haversine_matrix(stops):
@@ -327,7 +519,7 @@ def solve_tsp_ortools(stops, start_idx=0, matrix=None):
         return list(range(n)), 0
     
     if matrix is None:
-        matrix = build_distance_matrix(stops)
+        matrix = build_haversine_matrix(stops)
     
     # Create routing index manager
     manager = pywrapcp.RoutingIndexManager(n, 1, start_idx)
@@ -384,7 +576,7 @@ def fallback_nearest_neighbor(stops, start_idx=0, matrix=None):
         return [], 0
     
     if matrix is None:
-        matrix = build_distance_matrix(stops)
+        matrix = build_haversine_matrix(stops)
     
     visited = [False] * n
     route = [start_idx]
@@ -408,11 +600,11 @@ def fallback_nearest_neighbor(stops, start_idx=0, matrix=None):
     return route, total_dist / 1000  # Convert to km
 
 def optimize_route(stops, start_idx=0):
-    """Optimize route through stops using real road distances from OSRM.
+    """Optimize route through stops using real road distances from Google Maps.
     
     Features:
     - Uses actual road distances (not straight-line) for optimization
-    - OSRM automatically snaps stops to nearest road
+    - Google Maps automatically snaps stops to nearest road
     - OR-Tools finds minimum total distance route
     - Returns optimized order with road geometry for display
     """
@@ -421,18 +613,18 @@ def optimize_route(stops, start_idx=0):
     
     print(f"\nOptimizing route for {len(stops)} stops using REAL ROAD distances...")
     
-    # Get real road distance matrix from OSRM
+    # Get real road distance matrix from Google Maps
     # This automatically handles:
     # - Snapping points to nearest road
     # - Computing actual driving distances
     # - Considering one-way streets, road networks, etc.
-    print(f"   Getting road distance matrix from OSRM...")
-    matrix = get_osrm_distance_matrix(stops)
+    print(f"   Getting road distance matrix from Google Maps...")
+    matrix = get_google_distance_matrix(stops)
     
     # Check if we got valid road distances
     sample_dist = matrix[0][1] if len(stops) > 1 else 0
     if sample_dist == 999999999:
-        print(f"   OSRM unavailable, falling back to haversine distances")
+        print(f"   Google Maps unavailable, falling back to haversine distances")
         matrix = build_haversine_matrix(stops)
     else:
         print(f"   Road distance matrix ready ({len(stops)}x{len(stops)})")
@@ -443,10 +635,10 @@ def optimize_route(stops, start_idx=0):
     
     optimized = [stops[i] for i in route_idx]
     
-    # Get actual road geometry from OSRM for visualization
+    # Get actual road geometry from Google Maps for visualization
     road_geometry = None
     print(f"   Getting road path geometry for display...")
-    road_dist, road_geometry = get_osrm_route(optimized)
+    road_dist, road_geometry = get_google_route(optimized)
     
     if road_geometry:
         print(f"   Road path: {len(road_geometry)} points, {round(road_dist, 2)} km")
@@ -463,26 +655,38 @@ def optimize_route_in_zone(stops, start_idx=0, polygon=None):
     
     Features:
     - Uses actual road distances for optimization
-    - Route visualization stays inside zone boundaries
-    - If road goes outside zone, uses straight line path instead
-    - Backtracking is allowed to stay inside
+    - Route visualization uses real road paths from Google Maps
+    - Fetches each segment individually for reliable road geometry
     """
     if len(stops) <= 1:
         return stops, 0, None
     
-    print(f"\nOptimizing route for {len(stops)} stops (ZONE-CONSTRAINED)...")
+    print(f"\nOptimizing route for {len(stops)} stops...")
     
-    # Get road distance matrix from OSRM for optimization
-    print(f"   Getting road distance matrix from OSRM...")
-    matrix = get_osrm_distance_matrix(stops)
-    
-    # Check if we got valid road distances
-    sample_dist = matrix[0][1] if len(stops) > 1 else 0
-    if sample_dist == 999999999:
-        print(f"   OSRM unavailable, falling back to haversine distances")
-        matrix = build_haversine_matrix(stops)
+    # For small number of stops, use Google Distance Matrix for accurate road distances
+    # For larger sets, use haversine to avoid API limits/costs
+    if len(stops) <= 25:
+        print(f"   Getting road distance matrix from Google Maps...")
+        matrix = get_google_distance_matrix(stops)
+        
+        # Check if we got valid road distances (check a non-diagonal element)
+        valid_matrix = False
+        for i in range(min(len(stops), 3)):
+            for j in range(min(len(stops), 3)):
+                if i != j and matrix[i][j] > 0 and matrix[i][j] < 999999999:
+                    valid_matrix = True
+                    break
+            if valid_matrix:
+                break
+        
+        if not valid_matrix:
+            print(f"   Google Maps Distance Matrix unavailable, using haversine...")
+            matrix = build_haversine_matrix(stops)
+        else:
+            print(f"   Road distance matrix ready ({len(stops)}x{len(stops)})")
     else:
-        print(f"   Road distance matrix ready ({len(stops)}x{len(stops)})")
+        print(f"   Using haversine distances for {len(stops)} stops (faster)...")
+        matrix = build_haversine_matrix(stops)
     
     # Run Google OR-Tools optimization
     print(f"   Running OR-Tools solver (Guided Local Search)...")
@@ -490,25 +694,23 @@ def optimize_route_in_zone(stops, start_idx=0, polygon=None):
     
     optimized = [stops[i] for i in route_idx]
     
-    # Get route geometry that stays INSIDE the zone
-    road_geometry = None
-    if polygon:
-        print(f"   Getting zone-constrained road path...")
-        road_dist, road_geometry = get_route_inside_zone(optimized, polygon)
-        
-        if road_geometry:
-            print(f"   Zone-constrained path: {len(road_geometry)} points, {round(road_dist, 2)} km")
+    # Get REAL road geometry by fetching each segment from Google Maps
+    print(f"   Getting real road path from Google Maps (segment by segment)...")
+    road_dist, road_geometry = get_route_segments(optimized)
+    
+    if road_geometry and len(road_geometry) > len(optimized):
+        print(f"   ✅ Road path: {len(road_geometry)} points, {round(road_dist, 2)} km")
+        total_dist = road_dist
+    else:
+        print(f"   ⚠️ Could not get road geometry, trying batch route...")
+        road_dist, road_geometry = get_google_route(optimized)
+        if road_geometry and len(road_geometry) > len(optimized):
+            print(f"   ✅ Road path: {len(road_geometry)} points, {round(road_dist, 2)} km")
             total_dist = road_dist
         else:
-            print(f"   Could not get zone-constrained geometry, using OSRM...")
-            road_dist, road_geometry = get_osrm_route(optimized)
-            if road_geometry:
-                total_dist = road_dist
-    else:
-        # No polygon provided, use regular OSRM route
-        road_dist, road_geometry = get_osrm_route(optimized)
-        if road_geometry:
-            total_dist = road_dist
+            print(f"   ❌ Using straight line path (API issue)")
+            # Create straight line geometry as fallback
+            road_geometry = [[s['lat'], s['lon']] for s in optimized]
     
     print(f"   Optimization complete: {round(total_dist, 2)} km total distance")
     
@@ -518,40 +720,246 @@ def optimize_route_in_zone(stops, start_idx=0, polygon=None):
 # Auto Zone Creation with KMeans
 # ============================================================================
 
-# Zone size constraints
-MIN_ZONE_SIZE = 100
-MAX_ZONE_SIZE = 130
+# Zone size constraints (for auto-zone only, manual zones have no limit)
+MIN_ZONE_SIZE = 1    # Allow any number of stops
+MAX_ZONE_SIZE = 9999  # No upper limit
+
+# Target configuration for balanced zones
+TARGET_STOPS_PER_ZONE = 100  # Default target stops per zone
 
 def calculate_optimal_zones(total_stops):
     """
-    Calculate the optimal number of zones based on 100-130 stops per zone rule.
+    Calculate the optimal number of zones based on TARGET_STOPS_PER_ZONE.
     Returns (min_zones, max_zones, suggested_zones)
     """
     if total_stops < MIN_ZONE_SIZE:
         return None, None, None
     
     min_zones = max(1, -(-total_stops // MAX_ZONE_SIZE))  # ceil division
-    max_zones = total_stops // MIN_ZONE_SIZE
+    max_zones = total_stops // MIN_ZONE_SIZE if MIN_ZONE_SIZE > 0 else total_stops
     
-    # Suggested is the middle ground
-    avg_target = (MIN_ZONE_SIZE + MAX_ZONE_SIZE) // 2  # 115
-    suggested = max(min_zones, min(max_zones, round(total_stops / avg_target)))
+    # Suggested based on target stops per zone for balanced distribution
+    suggested = max(1, round(total_stops / TARGET_STOPS_PER_ZONE))
+    suggested = max(min_zones, min(max_zones, suggested))
     
     return min_zones, max_zones, suggested
 
-def auto_create_zones_kmeans(stops, num_zones=None):
+def calculate_cluster_compactness(cluster_stops):
     """
-    Automatically create zones using KMeans clustering.
-    Ensures each zone has 100-130 stops (points are geographically close).
+    Calculate how compact/tight a cluster is.
+    Returns the average distance from center and max spread.
+    Lower values = more compact = better for routing within zone.
+    """
+    if len(cluster_stops) < 2:
+        return 0, 0
+    
+    # Calculate center
+    center_lat = sum(s['lat'] for s in cluster_stops) / len(cluster_stops)
+    center_lon = sum(s['lon'] for s in cluster_stops) / len(cluster_stops)
+    
+    # Calculate distances from center
+    distances = []
+    for s in cluster_stops:
+        dist = haversine_distance(center_lat, center_lon, s['lat'], s['lon'])
+        distances.append(dist)
+    
+    avg_dist = sum(distances) / len(distances)
+    max_dist = max(distances)
+    
+    return avg_dist, max_dist
+
+def estimate_route_distance_compact(cluster_stops):
+    """
+    Estimate route distance using nearest neighbor, optimized for compact zones.
+    For compact zones, routes stay inside. For spread zones, they go outside.
+    """
+    if len(cluster_stops) < 2:
+        return 0
+    
+    # Use nearest neighbor algorithm
+    visited = [False] * len(cluster_stops)
+    current = 0
+    visited[0] = True
+    total_dist = 0
+    
+    for _ in range(len(cluster_stops) - 1):
+        best_next = -1
+        best_dist = float('inf')
+        
+        for j in range(len(cluster_stops)):
+            if not visited[j]:
+                dist = haversine_distance(
+                    cluster_stops[current]['lat'], cluster_stops[current]['lon'],
+                    cluster_stops[j]['lat'], cluster_stops[j]['lon']
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_next = j
+        
+        if best_next >= 0:
+            visited[best_next] = True
+            total_dist += best_dist
+            current = best_next
+    
+    # Road factor - compact zones have lower factor, spread zones higher
+    avg_spread, max_spread = calculate_cluster_compactness(cluster_stops)
+    
+    # If max spread > 2km, routes likely go outside zone - penalize heavily
+    if max_spread > 2.0:
+        road_factor = 1.4 + (max_spread - 2.0) * 0.5  # Increases penalty for spread zones
+    else:
+        road_factor = 1.3
+    
+    return total_dist * road_factor
+
+def create_contiguous_zones(stops, coordinates, num_zones):
+    """
+    Create zones using NEAREST NEIGHBOR clustering.
+    Each zone grows outward from a seed point, only adding nearby stops.
+    This GUARANTEES compact zones with no disconnected stops.
+    """
+    total_stops = len(stops)
+    target_per_zone = total_stops // num_zones
+    
+    print(f"      Using nearest-neighbor clustering for compactness...")
+    print(f"      Target: ~{target_per_zone} stops per zone")
+    
+    # Track which stops are assigned
+    assigned = [False] * total_stops
+    clusters = []
+    
+    # Pick seed points spread across the area using KMeans
+    kmeans = KMeans(n_clusters=num_zones, random_state=42, n_init=10)
+    kmeans.fit(coordinates)
+    seed_centers = kmeans.cluster_centers_
+    
+    # For each zone, grow outward from seed center
+    for zone_num in range(num_zones):
+        cluster = []
+        seed_center = seed_centers[zone_num]
+        
+        # Calculate how many stops this zone should have
+        remaining_zones = num_zones - zone_num
+        remaining_stops = sum(1 for a in assigned if not a)
+        zone_target = remaining_stops // remaining_zones
+        
+        # Find unassigned stops sorted by distance to seed center
+        candidates = []
+        for i in range(total_stops):
+            if not assigned[i]:
+                dist = haversine_distance(
+                    seed_center[0], seed_center[1],
+                    coordinates[i][0], coordinates[i][1]
+                )
+                candidates.append((i, dist))
+        
+        # Sort by distance (closest first)
+        candidates.sort(key=lambda x: x[1])
+        
+        # Take the closest stops up to target
+        # But also check maximum distance - don't add if too far
+        zone_stops_indices = []
+        for idx, dist in candidates:
+            if len(zone_stops_indices) >= zone_target:
+                break
+            
+            # Check if this stop is within reasonable distance of existing zone stops
+            if zone_stops_indices:
+                # Calculate distance to nearest zone stop
+                min_dist_to_zone = min(
+                    haversine_distance(
+                        coordinates[idx][0], coordinates[idx][1],
+                        coordinates[existing_idx][0], coordinates[existing_idx][1]
+                    )
+                    for existing_idx in zone_stops_indices
+                )
+                # Skip if too far from any zone stop (creates disconnected zone)
+                if min_dist_to_zone > 1.0:  # Max 1km gap
+                    continue
+            
+            zone_stops_indices.append(idx)
+            assigned[idx] = True
+        
+        clusters.append(zone_stops_indices)
+        print(f"      Zone {zone_num + 1}: {len(zone_stops_indices)} stops assigned")
+    
+    # Assign any remaining unassigned stops to nearest zone
+    for i in range(total_stops):
+        if not assigned[i]:
+            # Find nearest zone center
+            best_zone = 0
+            best_dist = float('inf')
+            for z, cluster in enumerate(clusters):
+                if not cluster:
+                    continue
+                # Find distance to zone center
+                zone_lat = np.mean([coordinates[idx][0] for idx in cluster])
+                zone_lon = np.mean([coordinates[idx][1] for idx in cluster])
+                dist = haversine_distance(
+                    coordinates[i][0], coordinates[i][1],
+                    zone_lat, zone_lon
+                )
+                if dist < best_dist:
+                    best_dist = dist
+                    best_zone = z
+            
+            clusters[best_zone].append(i)
+            assigned[i] = True
+    
+    print(f"      Final zone sizes: {[len(c) for c in clusters]}")
+    
+    return clusters
+
+def balance_zones_by_count(stops, clusters, target_per_zone):
+    """
+    Balance zones to have similar stop counts.
+    Moves boundary stops between adjacent zones.
+    """
+    tolerance = max(5, int(target_per_zone * 0.15))
+    
+    for iteration in range(50):
+        sizes = [len(c) for c in clusters]
+        if max(sizes) - min(sizes) <= tolerance * 2:
+            break
+        
+        # Find most imbalanced pair
+        for i in range(len(clusters) - 1):
+            diff = len(clusters[i]) - len(clusters[i + 1])
+            if abs(diff) > tolerance:
+                if diff > 0:
+                    # Move from i to i+1
+                    if clusters[i]:
+                        clusters[i + 1].append(clusters[i].pop())
+                else:
+                    # Move from i+1 to i
+                    if clusters[i + 1]:
+                        clusters[i].append(clusters[i + 1].pop(0))
+    
+    return clusters
+
+def auto_create_zones_kmeans(stops, num_zones=None, target_stops=None):
+    """
+    Create COMPACT zones with balanced workload for fair SMR assignment.
+    
+    Key principle: Create geographically TIGHT zones so routes stay INSIDE the zone.
+    
+    Algorithm:
+    1. Initial KMeans clustering
+    2. Balance by BOTH stop count AND geographic compactness
+    3. Ensure no zone is too spread out (routes would go outside)
     
     Args:
         stops: List of stops inside the big polygon
         num_zones: Number of zones (if None, auto-calculated)
+        target_stops: Target stops per zone (for initial calculation)
     
     Returns:
-        List of zone dictionaries with polygon, stops, and metadata
+        List of zone dictionaries with compact, balanced zones
     """
     total_stops = len(stops)
+    
+    if target_stops is None:
+        target_stops = TARGET_STOPS_PER_ZONE
     
     # Calculate valid zone range
     min_zones, max_zones, suggested = calculate_optimal_zones(total_stops)
@@ -562,46 +970,48 @@ def auto_create_zones_kmeans(stops, num_zones=None):
     
     # Auto-calculate if not provided
     if num_zones is None:
-        num_zones = suggested
+        num_zones = max(1, round(total_stops / target_stops))
     
-    # Validate num_zones is within valid range
-    if num_zones < min_zones or num_zones > max_zones:
-        print(f"   ❌ Invalid zone count. For {total_stops} stops, need {min_zones}-{max_zones} zones.")
-        return None
+    # Validate num_zones
+    num_zones = max(1, min(total_stops, num_zones))
+    target_per_zone = total_stops // num_zones
     
-    print(f"\n🤖 Auto-creating {num_zones} zones using KMeans clustering...")
+    print(f"\n🤖 Creating {num_zones} COMPACT & BALANCED zones...")
     print(f"   Total stops: {total_stops}")
-    print(f"   Rule: {MIN_ZONE_SIZE}-{MAX_ZONE_SIZE} stops per zone")
-    print(f"   Valid zone range: {min_zones}-{max_zones} zones")
+    print(f"   Target: ~{target_per_zone} stops per zone")
+    print(f"   Goal: Tight zones where routes stay INSIDE the zone")
     
-    # Prepare data for KMeans (lat, lon coordinates)
+    # Prepare data
     coordinates = np.array([[s['lat'], s['lon']] for s in stops])
     
-    # Run KMeans clustering
-    kmeans = KMeans(n_clusters=num_zones, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(coordinates)
-    centers = kmeans.cluster_centers_
+    # Use GRID-BASED approach for guaranteed contiguity
+    print(f"   📍 Step 1: Grid-based zone creation for contiguity...")
+    clusters = create_contiguous_zones(stops, coordinates, num_zones)
     
-    # Group stops by cluster
-    clusters = [[] for _ in range(num_zones)]
-    for i, label in enumerate(labels):
-        clusters[label].append(i)
-    
-    # Rebalance clusters to ensure 100-130 stops each
-    print(f"   Rebalancing clusters to {MIN_ZONE_SIZE}-{MAX_ZONE_SIZE} range...")
-    clusters = rebalance_clusters(stops, clusters, centers, coordinates)
+    # Calculate metrics
+    print(f"   📏 Step 2: Analyzing zone compactness...")
+    cluster_distances = []
+    for i, cluster in enumerate(clusters):
+        cluster_stops_list = [stops[idx] for idx in cluster]
+        avg_spread, max_spread = calculate_cluster_compactness(cluster_stops_list)
+        est_dist = estimate_route_distance_compact(cluster_stops_list)
+        cluster_distances.append(est_dist)
+        print(f"      Zone {i+1}: {len(cluster)} stops, spread={max_spread:.2f}km, ~{est_dist:.1f}km route")
     
     # Create zones
     auto_zones = []
     
+    print(f"\n   📊 Final zone distribution:")
     for cluster_id, cluster_indices in enumerate(clusters):
         if len(cluster_indices) == 0:
             continue
         
         cluster_stops = [stops[i] for i in cluster_indices]
-        print(f"   Zone {cluster_id + 1}: {len(cluster_stops)} stops")
+        estimated_dist = cluster_distances[cluster_id]
         
-        # Create convex hull polygon around cluster points
+        print(f"      Zone {cluster_id + 1}: {len(cluster_stops)} stops, ~{estimated_dist:.1f}km route")
+        
+        # Create convex hull polygon
         cluster_coords = [(s['lat'], s['lon']) for s in cluster_stops]
         cluster_polygon = create_convex_hull(cluster_coords)
         
@@ -610,51 +1020,73 @@ def auto_create_zones_kmeans(stops, num_zones=None):
             'name': f'Zone {cluster_id + 1}',
             'polygon': cluster_polygon,
             'stops': cluster_stops,
-            'total_stops': len(cluster_stops)
+            'total_stops': len(cluster_stops),
+            'estimated_distance_km': round(estimated_dist, 2)
         }
         
         auto_zones.append(zone)
     
-    print(f"   ✅ Created {len(auto_zones)} zones successfully")
+    # Report balance quality
+    if cluster_distances:
+        avg_dist = sum(cluster_distances) / len(cluster_distances)
+        max_dist = max(cluster_distances)
+        min_dist = min(cluster_distances)
+        variance_pct = ((max_dist - min_dist) / avg_dist * 100) if avg_dist > 0 else 0
+        
+        print(f"\n   ✅ Created {len(auto_zones)} balanced zones")
+        print(f"      Average distance: {avg_dist:.1f}km")
+        print(f"      Range: {min_dist:.1f}km - {max_dist:.1f}km")
+        print(f"      Variance: ±{variance_pct/2:.1f}%")
     
     return auto_zones
 
-def rebalance_clusters(stops, clusters, centers, coordinates):
+def balance_for_compactness(stops, clusters, centers, coordinates, num_zones):
     """
-    Rebalance clusters to ensure each has 100-130 stops.
-    Moves points from oversized clusters to undersized neighbors.
-    """
-    max_iterations = 50
+    Balance zones for BOTH equal stop count AND geographic compactness.
+    This ensures routes stay inside zones (no detours outside).
     
+    Strategy:
+    1. First balance stop counts (so each zone has similar number of stops)
+    2. Then ensure each zone is geographically compact
+    3. Move outlier points to their nearest zone
+    """
+    target_stops = len(stops) // num_zones
+    tolerance = max(10, int(target_stops * 0.20))  # Allow 20% deviation
+    
+    print(f"      Target: ~{target_stops} stops per zone (±{tolerance})")
+    
+    # PHASE 1: Balance stop counts
+    max_iterations = 500
     for iteration in range(max_iterations):
-        # Check if all clusters are within range
-        all_valid = True
-        for cluster in clusters:
-            if len(cluster) < MIN_ZONE_SIZE or len(cluster) > MAX_ZONE_SIZE:
-                all_valid = False
-                break
+        sizes = [len(c) for c in clusters]
+        min_size, max_size = min(sizes), max(sizes)
         
-        if all_valid:
+        # Check if balanced enough
+        if max_size - min_size <= tolerance:
             break
         
         # Find oversized and undersized clusters
-        oversized = [(i, len(c)) for i, c in enumerate(clusters) if len(c) > MAX_ZONE_SIZE]
-        undersized = [(i, len(c)) for i, c in enumerate(clusters) if len(c) < MIN_ZONE_SIZE]
+        oversized = [(i, s) for i, s in enumerate(sizes) if s > target_stops + tolerance // 2]
+        undersized = [(i, s) for i, s in enumerate(sizes) if s < target_stops - tolerance // 2]
         
-        if not oversized and not undersized:
+        if not oversized or not undersized:
             break
         
-        # Move points from oversized to undersized clusters
-        for over_idx, over_size in sorted(oversized, key=lambda x: -x[1]):
-            if len(clusters[over_idx]) <= MAX_ZONE_SIZE:
+        # Sort by size
+        oversized.sort(key=lambda x: -x[1])
+        undersized.sort(key=lambda x: x[1])
+        
+        moved = False
+        for over_idx, _ in oversized:
+            if len(clusters[over_idx]) <= target_stops:
                 continue
             
             # Find nearest undersized cluster
             best_under_idx = None
             best_dist = float('inf')
             
-            for under_idx, under_size in undersized:
-                if len(clusters[under_idx]) >= MIN_ZONE_SIZE:
+            for under_idx, _ in undersized:
+                if len(clusters[under_idx]) >= target_stops:
                     continue
                 dist = haversine_distance(
                     centers[over_idx][0], centers[over_idx][1],
@@ -664,22 +1096,10 @@ def rebalance_clusters(stops, clusters, centers, coordinates):
                     best_dist = dist
                     best_under_idx = under_idx
             
-            if best_under_idx is None:
-                # No undersized cluster, find any cluster that can accept
-                for i, c in enumerate(clusters):
-                    if i != over_idx and len(c) < MAX_ZONE_SIZE:
-                        dist = haversine_distance(
-                            centers[over_idx][0], centers[over_idx][1],
-                            centers[i][0], centers[i][1]
-                        )
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_under_idx = i
-            
             if best_under_idx is not None:
-                # Find point in oversized cluster closest to undersized center
+                # Move the point closest to undersized center
                 target_center = centers[best_under_idx]
-                best_point_idx = None
+                best_point = None
                 best_point_dist = float('inf')
                 
                 for point_idx in clusters[over_idx]:
@@ -689,18 +1109,204 @@ def rebalance_clusters(stops, clusters, centers, coordinates):
                     )
                     if dist < best_point_dist:
                         best_point_dist = dist
-                        best_point_idx = point_idx
+                        best_point = point_idx
                 
-                if best_point_idx is not None:
-                    clusters[over_idx].remove(best_point_idx)
-                    clusters[best_under_idx].append(best_point_idx)
+                if best_point is not None:
+                    clusters[over_idx].remove(best_point)
+                    clusters[best_under_idx].append(best_point)
+                    moved = True
+                    
+                    # Update centers
+                    if clusters[over_idx]:
+                        centers[over_idx] = np.mean([coordinates[j] for j in clusters[over_idx]], axis=0)
+                    centers[best_under_idx] = np.mean([coordinates[j] for j in clusters[best_under_idx]], axis=0)
         
-        # Update centers
-        for i, cluster in enumerate(clusters):
-            if len(cluster) > 0:
-                centers[i] = np.mean([coordinates[j] for j in cluster], axis=0)
+        if not moved:
+            break
+    
+    # PHASE 2: Move outliers to nearest cluster for compactness
+    print(f"      Phase 2: Ensuring geographic compactness...")
+    
+    for iteration in range(100):
+        moved = False
+        
+        for cluster_idx, cluster in enumerate(clusters):
+            if len(cluster) <= 5:
+                continue
+            
+            cluster_stops_list = [stops[idx] for idx in cluster]
+            center_lat = sum(s['lat'] for s in cluster_stops_list) / len(cluster_stops_list)
+            center_lon = sum(s['lon'] for s in cluster_stops_list) / len(cluster_stops_list)
+            
+            # Find outliers (points far from center)
+            point_dists = []
+            for point_idx in cluster:
+                dist = haversine_distance(
+                    center_lat, center_lon,
+                    coordinates[point_idx][0], coordinates[point_idx][1]
+                )
+                point_dists.append((point_idx, dist))
+            
+            point_dists.sort(key=lambda x: -x[1])  # Farthest first
+            
+            # Check if farthest point should move to another cluster
+            for point_idx, dist_from_center in point_dists[:3]:  # Check top 3 outliers
+                # Find which cluster center is closest to this point
+                best_cluster = cluster_idx
+                best_dist = dist_from_center
+                
+                for other_idx, other_cluster in enumerate(clusters):
+                    if other_idx == cluster_idx:
+                        continue
+                    if len(other_cluster) >= target_stops + tolerance:
+                        continue  # Don't make other cluster too big
+                    
+                    other_center = centers[other_idx]
+                    dist_to_other = haversine_distance(
+                        coordinates[point_idx][0], coordinates[point_idx][1],
+                        other_center[0], other_center[1]
+                    )
+                    
+                    if dist_to_other < best_dist * 0.7:  # Must be significantly closer
+                        best_dist = dist_to_other
+                        best_cluster = other_idx
+                
+                # Move point if another cluster is closer
+                if best_cluster != cluster_idx and len(clusters[cluster_idx]) > target_stops - tolerance:
+                    clusters[cluster_idx].remove(point_idx)
+                    clusters[best_cluster].append(point_idx)
+                    moved = True
+                    
+                    # Update centers
+                    if clusters[cluster_idx]:
+                        centers[cluster_idx] = np.mean([coordinates[j] for j in clusters[cluster_idx]], axis=0)
+                    centers[best_cluster] = np.mean([coordinates[j] for j in clusters[best_cluster]], axis=0)
+        
+        if not moved:
+            break
+    
+    # Final report
+    sizes = [len(c) for c in clusters]
+    print(f"      Final: min={min(sizes)}, max={max(sizes)}, target={target_stops}")
     
     return clusters
+
+def balance_by_distance(stops, clusters, centers, coordinates, cluster_distances):
+    """
+    Rebalance clusters to equalize total travel distance across zones.
+    Moves boundary points from high-distance zones to low-distance zones.
+    """
+    num_clusters = len(clusters)
+    max_iterations = 300
+    
+    # Target: average distance
+    target_distance = sum(cluster_distances) / num_clusters if num_clusters > 0 else 0
+    tolerance_pct = 0.15  # Allow 15% deviation from target
+    
+    print(f"      Target distance per zone: ~{target_distance:.1f}km (±{tolerance_pct*100:.0f}%)")
+    
+    for iteration in range(max_iterations):
+        # Find zones that are too far from target
+        max_dist = max(cluster_distances)
+        min_dist = min(cluster_distances)
+        
+        # Check if balanced enough (within 20% range)
+        if max_dist - min_dist <= target_distance * 0.25:
+            print(f"      ✓ Balanced after {iteration} iterations")
+            break
+        
+        # Find high and low distance zones
+        high_zones = [(i, d) for i, d in enumerate(cluster_distances) 
+                      if d > target_distance * (1 + tolerance_pct) and len(clusters[i]) > 5]
+        low_zones = [(i, d) for i, d in enumerate(cluster_distances) 
+                     if d < target_distance * (1 - tolerance_pct)]
+        
+        if not high_zones or not low_zones:
+            break
+        
+        # Sort by distance (move from highest to lowest)
+        high_zones.sort(key=lambda x: -x[1])
+        low_zones.sort(key=lambda x: x[1])
+        
+        moved = False
+        for high_idx, high_dist in high_zones:
+            if len(clusters[high_idx]) <= 5:  # Keep minimum stops
+                continue
+            
+            # Find nearest low-distance zone
+            best_low_idx = None
+            best_transfer_dist = float('inf')
+            
+            for low_idx, low_dist in low_zones:
+                # Check if zones are adjacent (centers within reasonable distance)
+                center_dist = haversine_distance(
+                    centers[high_idx][0], centers[high_idx][1],
+                    centers[low_idx][0], centers[low_idx][1]
+                )
+                if center_dist < best_transfer_dist:
+                    best_transfer_dist = center_dist
+                    best_low_idx = low_idx
+            
+            if best_low_idx is not None:
+                # Find boundary points (closest to the low zone's center)
+                target_center = centers[best_low_idx]
+                
+                # Get points sorted by distance to target zone
+                point_distances = []
+                for point_idx in clusters[high_idx]:
+                    dist = haversine_distance(
+                        coordinates[point_idx][0], coordinates[point_idx][1],
+                        target_center[0], target_center[1]
+                    )
+                    point_distances.append((point_idx, dist))
+                
+                point_distances.sort(key=lambda x: x[1])
+                
+                # Move 1-3 closest points
+                points_to_move = min(3, len(point_distances) // 4, len(clusters[high_idx]) - 5)
+                
+                for i in range(points_to_move):
+                    if i < len(point_distances):
+                        point_idx = point_distances[i][0]
+                        clusters[high_idx].remove(point_idx)
+                        clusters[best_low_idx].append(point_idx)
+                        moved = True
+                
+                # Recalculate distances for affected clusters
+                if moved:
+                    cluster_distances[high_idx] = estimate_route_distance_compact(
+                        [stops[idx] for idx in clusters[high_idx]]
+                    )
+                    cluster_distances[best_low_idx] = estimate_route_distance_compact(
+                        [stops[idx] for idx in clusters[best_low_idx]]
+                    )
+                    
+                    # Update centers
+                    if clusters[high_idx]:
+                        centers[high_idx] = np.mean([coordinates[j] for j in clusters[high_idx]], axis=0)
+                    if clusters[best_low_idx]:
+                        centers[best_low_idx] = np.mean([coordinates[j] for j in clusters[best_low_idx]], axis=0)
+        
+        if not moved:
+            break
+    
+    return clusters, cluster_distances
+
+def calculate_zone_spread(cluster_stops):
+    """Calculate the maximum spread (diameter) of a zone in km."""
+    if len(cluster_stops) < 2:
+        return 0
+    
+    max_dist = 0
+    # Sample for efficiency if too many stops
+    sample = cluster_stops if len(cluster_stops) <= 50 else cluster_stops[::len(cluster_stops)//50]
+    
+    for i, s1 in enumerate(sample):
+        for s2 in sample[i+1:]:
+            dist = haversine_distance(s1['lat'], s1['lon'], s2['lat'], s2['lon'])
+            max_dist = max(max_dist, dist)
+    
+    return max_dist
 
 def create_convex_hull(points):
     """Create convex hull polygon from points using Graham scan algorithm"""
@@ -813,6 +1419,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             
             stops = post_data['stops']
             num_zones = post_data.get('num_zones')
+            target_stops = post_data.get('target_stops', TARGET_STOPS_PER_ZONE)  # Allow custom target
             
             # Calculate valid zone range
             total_stops = len(stops)
@@ -843,10 +1450,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     }).encode())
                     return
             else:
-                num_zones = suggested
+                num_zones = max(1, round(total_stops / target_stops))
             
-            # Generate zones using KMeans
-            auto_zones = auto_create_zones_kmeans(stops, num_zones)
+            # Generate zones using KMeans with smart balancing
+            auto_zones = auto_create_zones_kmeans(stops, num_zones, target_stops)
             
             if auto_zones:
                 # Optimize route for each zone
@@ -1147,12 +1754,23 @@ def generate_main_page(stops):
             
             <!-- Auto-Zone Section -->
             <div id="autoZoneSection" style="margin-bottom: 15px; padding: 12px; background: linear-gradient(135deg, #fff3e0, #ffe0b2); border-radius: 8px; border: 2px solid #ff9800;">
-                <label style="font-weight: bold; color: #e65100; font-size: 14px;">🤖 Auto Create Zones (KMeans AI)</label>
-                <p style="font-size: 11px; color: #666; margin: 5px 0;">Each zone will have <b>100-130</b> closest stops</p>
+                <label style="font-weight: bold; color: #e65100; font-size: 14px;">⚖️ Distance-Balanced Zone Creator</label>
+                <p style="font-size: 11px; color: #666; margin: 5px 0;">Creates zones with <b>EQUAL TRAVEL DISTANCE</b> for fair SMR workload</p>
                 <div id="zoneRangeInfo" style="font-size: 12px; color: #1565c0; margin: 8px 0; padding: 5px; background: #e3f2fd; border-radius: 4px;"></div>
-                <input type="number" id="numZones" placeholder="Number of zones" min="1" max="50" style="margin-top: 5px;">
-                <button class="btn-primary" onclick="autoCreateZones()" style="margin-top: 8px; background: #ff9800;">
-                    ⚡ Auto Generate Zones
+                
+                <div style="display: flex; gap: 8px; margin-top: 8px;">
+                    <div style="flex: 1;">
+                        <label style="font-size: 11px; color: #666;">Target stops/zone:</label>
+                        <input type="number" id="targetStops" placeholder="100" value="100" min="20" max="500" style="width: 100%;">
+                    </div>
+                    <div style="flex: 1;">
+                        <label style="font-size: 11px; color: #666;">Zones (auto if empty):</label>
+                        <input type="number" id="numZones" placeholder="Auto" min="1" max="50" style="width: 100%;">
+                    </div>
+                </div>
+                <p style="font-size: 10px; color: #2e7d32; margin: 5px 0; font-weight: bold;">💡 All zones will have similar route distances (e.g., 16km, 17km, 18km)</p>
+                <button class="btn-primary" onclick="autoCreateZones()" style="margin-top: 8px; background: #ff9800; width: 100%;">
+                    ⚡ Generate Distance-Balanced Zones
                 </button>
             </div>
             
@@ -1775,58 +2393,67 @@ def generate_main_page(stops):
         }}
         
         function updateZoneRangeInfo(totalStops) {{
-            const minZoneSize = 100;
-            const maxZoneSize = 130;
             const infoDiv = document.getElementById('zoneRangeInfo');
+            const targetInput = document.getElementById('targetStops');
+            const targetStops = parseInt(targetInput.value) || 100;
             
-            if (totalStops < minZoneSize) {{
-                infoDiv.innerHTML = `⚠️ Need at least <b>100</b> stops. You have <b>${{totalStops}}</b>.`;
+            if (totalStops < 2) {{
+                infoDiv.innerHTML = `⚠️ Need at least <b>2</b> stops. You have <b>${{totalStops}}</b>.`;
                 infoDiv.style.background = '#ffebee';
                 infoDiv.style.color = '#c62828';
                 document.getElementById('numZones').disabled = true;
                 return;
             }}
             
-            const minZones = Math.ceil(totalStops / maxZoneSize);
-            const maxZones = Math.floor(totalStops / minZoneSize);
-            const suggested = Math.round(totalStops / 115);
+            // Suggest zones based on target stops per zone
+            const suggested = Math.max(1, Math.round(totalStops / targetStops));
+            const maxZones = Math.min(50, totalStops);
             
-            infoDiv.innerHTML = `📊 <b>${{totalStops}}</b> stops → Valid: <b>${{minZones}}-${{maxZones}}</b> zones (suggested: <b>${{suggested}}</b>)`;
+            infoDiv.innerHTML = `📊 <b>${{totalStops}}</b> stops → <b>${{suggested}}</b> zones (~${{targetStops}} each)<br>
+                <span style="font-size:10px;">Balanced for fair SMR workload</span>`;
             infoDiv.style.background = '#e3f2fd';
             infoDiv.style.color = '#1565c0';
             document.getElementById('numZones').disabled = false;
-            document.getElementById('numZones').min = minZones;
+            document.getElementById('numZones').min = 1;
             document.getElementById('numZones').max = maxZones;
-            document.getElementById('numZones').value = suggested;
-            document.getElementById('numZones').placeholder = `${{minZones}}-${{maxZones}} zones`;
+            document.getElementById('numZones').value = '';
+            document.getElementById('numZones').placeholder = `Auto (${{suggested}})`;
         }}
+        
+        // Update zone count when target changes
+        document.getElementById('targetStops').addEventListener('change', function() {{
+            updateZoneRangeInfo(selectedStops.length);
+        }});
         
         async function autoCreateZones() {{
             const totalStops = selectedStops.length;
-            const minZoneSize = 100;
-            const maxZoneSize = 130;
             
-            if (totalStops < minZoneSize) {{
-                alert(`⚠️ Not enough stops!\n\nYou need at least 100 stops.\nCurrently selected: ${{totalStops}} stops`);
+            if (totalStops < 2) {{
+                alert(`⚠️ Not enough stops!\n\nYou need at least 2 stops.\nCurrently selected: ${{totalStops}} stops`);
                 return;
             }}
             
-            const minZones = Math.ceil(totalStops / maxZoneSize);
-            const maxZones = Math.floor(totalStops / minZoneSize);
-            const numZones = parseInt(document.getElementById('numZones').value);
+            const targetStops = parseInt(document.getElementById('targetStops').value) || 100;
+            let numZones = parseInt(document.getElementById('numZones').value);
+            const maxZones = Math.min(50, totalStops);
             
-            if (!numZones || numZones < minZones || numZones > maxZones) {{
-                alert(`⚠️ Invalid zone count!\n\nFor ${{totalStops}} stops with 100-130 per zone:\n• Minimum zones: ${{minZones}}\n• Maximum zones: ${{maxZones}}\n\nPlease enter a value between ${{minZones}} and ${{maxZones}}.`);
+            // Auto-calculate if not provided
+            if (!numZones || isNaN(numZones)) {{
+                numZones = Math.max(1, Math.round(totalStops / targetStops));
+            }}
+            
+            if (numZones < 1 || numZones > maxZones) {{
+                alert(`⚠️ Invalid zone count!\n\nPlease enter a value between 1 and ${{maxZones}}.`);
                 return;
             }}
             
             const avgPerZone = Math.round(totalStops / numZones);
-            if (!confirm(`🤖 Auto-create ${{numZones}} zones using AI clustering?\n\n📊 Stats:\n• Total stops: ${{totalStops}}\n• Average per zone: ~${{avgPerZone}} stops\n• Each zone: 100-130 stops (guaranteed)\n\nThis will optimize routes for all zones automatically.`)) {{
+            if (!confirm(`⚖️ Create ${{numZones}} DISTANCE-BALANCED zones?\n\n📊 Configuration:\n• Total stops: ${{totalStops}}\n• Zones: ${{numZones}}\n• ~${{avgPerZone}} stops per zone\n\n✨ All zones will have SIMILAR TRAVEL DISTANCE\n(e.g., Zone 1: 16km, Zone 2: 17km, Zone 3: 18km)\n\nThis ensures fair workload for SMR assignment.`)) {{
                 return;
             }}
             
             // Show loading
-            document.getElementById('loading').textContent = `🤖 AI creating ${{numZones}} zones...\nThis may take a few minutes.`;
+            document.getElementById('loading').textContent = `⚖️ Creating ${{numZones}} distance-balanced zones...\nOptimizing for equal travel distance.`;
             document.getElementById('loading').style.display = 'block';
             
             try {{
@@ -1835,7 +2462,8 @@ def generate_main_page(stops):
                     headers: {{ 'Content-Type': 'application/json' }},
                     body: JSON.stringify({{
                         stops: selectedStops,
-                        num_zones: numZones
+                        num_zones: numZones,
+                        target_stops: targetStops
                     }})
                 }});
                 
@@ -1919,6 +2547,9 @@ def main():
     RequestHandler.stops = stops
     RequestHandler.zones_data = load_zones_from_file()
     print(f"   📋 Loaded {len(RequestHandler.zones_data['zones'])} existing zones")
+
+    if not GOOGLE_MAPS_API_KEY:
+        print("   WARNING: GOOGLE_MAPS_API_KEY is not configured; using straight-line routing fallbacks")
     
     # Get local IP address (first non-localhost IP)
     import socket

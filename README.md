@@ -1,217 +1,269 @@
 # SMR Route Optimizer
 
-A powerful single-page web application for optimizing delivery routes with AI-powered automatic zone creation using KMeans clustering.
+SMR Route Optimizer is a single-file Python web application for creating sales or
+delivery zones and calculating an ordered route through the shops in each zone.
+It serves an interactive Leaflet map, exposes a JSON API, and persists zones and
+route geometry in `zones_routes.json`.
+
+The current dataset contains 24,724 shops in the `dhk_metro` area.
 
 ## Features
 
-### Core Features
-- 🗺️ **Interactive Map** - OpenStreetMap with marker clustering (24,000+ stops supported)
-- ✏️ **Draw Zones** - Draw polygon or rectangle zones on the map
-- 📝 **Name Zones** - Assign custom names to each zone
-- ✏️ **Rename Zones** - Edit zone names anytime (click pencil icon)
-- 🎯 **Select Start Point** - Choose where the delivery route begins
-- 🚗 **Route Optimization** - Calculates optimal delivery path using Google OR-Tools TSP solver
-- 🛣️ **Real Road Routing** - Uses OSRM API for actual road distances (not straight-line)
-- 🎨 **Visual Routes** - Each zone has unique color with numbered markers
-- 🟢 **Start/End Markers** - Green start point, red end point
-- 💾 **Auto Save** - All zones saved to JSON file
-- 📱 **Network Access** - Access from any device on local network
-- 🗑️ **Delete Zones** - Remove individual zones or clear all
+- OpenStreetMap and Leaflet map with clustered shop markers
+- Polygon and rectangle selection
+- Manual zones with a selectable starting shop
+- Automatic compact zones with a configurable target stop count
+- KMeans seed selection and nearest-neighbor geographic assignment
+- Google OR-Tools route ordering using Guided Local Search
+- Google Maps distance and route-geometry integration
+- Haversine fallback for large zones or unavailable APIs
+- Numbered route markers with distinct start and end markers
+- Rename, delete, focus, and clear zone actions
+- Persistent zone data and cached Google Maps route segments
+- Local and local-network access
 
-### AI Auto-Zone Creation (KMeans)
-- 🤖 **KMeans Clustering** - Automatically split large areas into optimal zones
-- 📊 **Smart Zone Sizing** - Each zone guaranteed 100-130 stops
-- 🎯 **Geographic Clustering** - Ensures closest stops are grouped together
-- ⚖️ **Auto-Rebalancing** - Moves points between clusters to meet size constraints
-- 📏 **Valid Range Calculator** - Shows min/max zones based on total stops
-- 🏷️ **Auto-Naming** - Zones named "Zone 1", "Zone 2", etc.
+## Routing Behavior
+
+Routing depends on the number of shops in a zone:
+
+- For 2-25 shops, Google Distance Matrix provides the OR-Tools cost matrix.
+- For more than 25 shops, a Haversine matrix is used to limit API usage.
+- After ordering, Google Directions geometry is requested one segment at a time
+  in walking mode.
+- Successful segment responses are cached in `cache/`.
+- Failed segments fall back to a straight line and Haversine distance.
+
+Routes are open paths. They start at the selected shop and finish at the last
+optimized shop without returning to the start.
+
+## Automatic Zone Creation
+
+Draw a large polygon and provide either a target number of shops per zone or an
+explicit number of zones. When the zone count is empty, it is calculated as:
+
+```text
+round(selected shops / target shops per zone)
+```
+
+The default target is 100 shops. The backend currently permits 1-9,999 shops per
+zone, and the browser limits automatic creation to 50 zones.
+
+The automatic-zone process:
+
+1. Uses KMeans to select distributed seed centers.
+2. Grows each zone with nearby unassigned shops.
+3. Applies a 1 km nearest-shop gap check during initial assignment.
+4. Assigns remaining shops to the nearest zone center.
+5. Creates a convex-hull zone boundary.
+6. Estimates distance and optimizes the final route.
+
+The algorithm prioritizes compact geography and approximately balanced shop
+counts. Final route distances may vary due to road access, density, and routing
+fallbacks.
 
 ## Requirements
 
-```bash
-# Python packages
-pip install numpy scikit-learn ortools
-```
-
 - Python 3.8+
-- numpy
-- scikit-learn (for KMeans clustering)
-- ortools (Google OR-Tools for TSP optimization)
+- NumPy
+- scikit-learn
+- Google OR-Tools
+- Google Maps API key with Directions API and Distance Matrix API access
+- Internet access for frontend assets, map tiles, and uncached route requests
 
-## Folder Structure
+Install dependencies:
 
+```bash
+python -m pip install numpy scikit-learn ortools
 ```
-SMR PO/
-├── smr-po.py                              # Main application script
-├── product_sense_public_shops_with_area.json  # Stop/shop data (required)
-├── zones_routes.json                      # Saved zones & routes (auto-generated)
-├── README.md                              # Documentation
-├── Assets/                                # Screenshots and assets
-└── cache/                                 # OSRM route cache
+
+The existing project environment is:
+
+```bash
+conda activate smrpo
 ```
+
+Create the local environment file before the first run:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and set `GOOGLE_MAPS_API_KEY`. The `.env` file is ignored by Git.
 
 ## Configuration
 
-Edit these variables in `smr-po.py` (lines 22-26):
+Runtime settings are loaded from environment variables and the ignored `.env` file:
 
-```python
-DATA_FILE = 'product_sense_public_shops_with_area.json'  # Input data file
-WORKING_DIR = '/home/sajadulakash/Desktop/SMR PO'        # Working directory
-OUTPUT_FILE = 'zones_routes.json'                        # Output file
-PORT = 9541                                              # Server port
+```dotenv
+GOOGLE_MAPS_API_KEY=replace-with-your-google-maps-api-key
+GOOGLE_MAPS_TIMEOUT=60
+SMR_PORT=9541
+# SMR_WORKING_DIR=/absolute/path/to/project
+# SMR_DATA_FILE=product_sense_public_shops_with_area.json
+# SMR_OUTPUT_FILE=zones_routes.json
 ```
 
-### Zone Size Constraints (lines 521-522):
+Exported environment variables take precedence over values in `.env`. Restrict
+the Google Maps key to the required APIs and appropriate clients. Never commit
+the local `.env` file.
 
-```python
-MIN_ZONE_SIZE = 100  # Minimum stops per zone
-MAX_ZONE_SIZE = 130  # Maximum stops per zone
-```
-
-## Usage
-
-### Start the Server
+## Run
 
 ```bash
 cd "/home/sajadulakash/Desktop/SMR PO"
 conda activate smrpo
+# Configure .env first if it does not already exist
 python smr-po.py
 ```
 
-### Access URLs
+| Access | URL |
+|---|---|
+| Local | `http://localhost:9541` |
+| Local network | `http://YOUR_LOCAL_IP:9541` |
 
-| Device | URL |
-|--------|-----|
-| Local | http://localhost:9541 |
-| Network | http://YOUR_IP:9541 |
+The server listens on all interfaces and attempts to open the local URL in the
+default browser. Stop it with `Ctrl+C`.
 
-### Create a Single Zone (Manual)
+## Usage
 
-1. **Draw** - Use polygon/rectangle tool to draw a zone on the map
-2. **Name** - Enter a name for the zone in the sidebar
-3. **Start Point** - Select the starting shop from dropdown
-4. **Calculate** - Click "Calculate Optimized Route"
-5. **Repeat** - Add more zones as needed
+### Manual Zone
 
-### Create Multiple Zones (AI Auto-Zone)
+1. Draw a polygon or rectangle around shops.
+2. Enter a zone name.
+3. Select the starting shop.
+4. Click **Calculate Optimized Route**.
+5. Wait for route optimization and geometry requests.
 
-1. **Draw Large Area** - Draw a polygon covering 700-1000+ stops
-2. **View Range** - System shows valid zone range (e.g., "5-8 zones")
-3. **Enter Count** - Type number of zones you want
-4. **Generate** - Click "⚡ Auto Generate Zones"
-5. **Wait** - AI clusters stops and optimizes all routes automatically
+### Automatic Zones
 
-### Manage Zones
+1. Draw around a larger group of shops.
+2. Set target shops per zone or enter a zone count.
+3. Click **Generate Distance-Balanced Zones**.
+4. Confirm the configuration.
+5. Wait while each generated zone is optimized and saved.
 
-- **Rename** - Click ✏️ pencil icon → type new name → press Enter
-- **Delete** - Click 🗑️ trash icon on individual zone
-- **Clear All** - Click "Clear All Zones" button
-- **Focus** - Click zone name to pan/zoom to that zone on map
+### Saved Zones
 
-## Input Data Format
+- Click a zone name to focus it on the map.
+- Use the pencil button to rename it.
+- Use the trash button to delete it.
+- Use **Clear All Zones** to remove all saved zones.
 
-The input JSON file should contain an array of shops:
+## Project Structure
+
+```text
+SMR PO/
+|-- smr-po.py
+|-- product_sense_public_shops_with_area.json
+|-- zones_routes.json
+|-- README.md
+|-- Assets/
+|   |-- smr-route-optimizer.png
+|   `-- ai-auto-zone-creation-KMeans.png
+|-- cache/
+`-- __pycache__/
+```
+
+`cache/` and `__pycache__/` are generated. The input dataset and route cache
+are excluded by `.gitignore`.
+
+## Input Format
+
+The input is a JSON array:
 
 ```json
 [
   {
-    "id": "123",
+    "id": "shop-id",
     "name": "Shop Name",
+    "area": "dhk_metro",
     "address": "Shop Address",
-    "area": "Area Name",
-    "lat": "23.8692469° N",
-    "long": "90.3686844° E"
+    "lat": "23.8692469 N",
+    "long": "90.4110807 E"
   }
 ]
 ```
 
-## Output Data Format
+Coordinates can include degree and compass suffixes. Records without usable
+latitude or longitude are skipped.
 
-The `zones_routes.json` file contains:
+## Output Format
+
+`zones_routes.json` contains a top-level `zones` array:
 
 ```json
 {
   "zones": [
     {
-      "name": "Zone Name",
-      "polygon": [[lat, lon], ...],
-      "total_stops": 115,
-      "total_distance_km": 12.5,
+      "name": "Zone 1",
+      "polygon": [[23.86, 90.41], [23.87, 90.42]],
+      "total_stops": 100,
+      "total_distance_km": 8.75,
       "route": [
-        {"id": "1", "name": "Shop 1", "lat": 23.86, "lon": 90.36},
-        ...
+        {
+          "id": "shop-id",
+          "name": "Shop Name",
+          "address": "Shop Address",
+          "lat": 23.8692469,
+          "lon": 90.4110807
+        }
       ],
-      "road_geometry": [[lat, lon], ...]
+      "road_geometry": [[23.86924, 90.41108]]
     }
   ]
 }
 ```
 
+Automatically created zones may also include `stops` and
+`estimated_distance_km`.
+
+## HTTP API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/` | Serve the map |
+| `GET` | `/api/zones` | Return saved zones |
+| `POST` | `/api/optimize` | Optimize and save one zone |
+| `POST` | `/api/auto-create-zones` | Generate, optimize, and save zones |
+| `POST` | `/api/rename-zone` | Rename a zone by index |
+| `POST` | `/api/delete-zone` | Delete a zone by index |
+| `POST` | `/api/clear` | Delete all zones |
+
+The server has no authentication. Use it only on a trusted network unless an
+authenticated reverse proxy or equivalent protection is added.
+
 ## Algorithms
 
-### Google OR-Tools TSP Solver
-- Uses Guided Local Search metaheuristic
-- Same algorithm used by Google Maps
-- 5-second optimization limit per zone
-- Finds near-optimal solutions for routes
+### OR-Tools
 
-### OSRM Road Routing
-- Real road distance matrix (not straight-line)
-- Automatic point snapping to nearest road
-- Considers one-way streets and road networks
-- Route geometry for accurate map visualization
+Uses `PATH_CHEAPEST_ARC` for the initial solution and `GUIDED_LOCAL_SEARCH`
+for improvement, with a five-second limit per zone.
 
-### KMeans Clustering (Auto-Zone)
-- Groups geographically close stops together
-- Iterative rebalancing to meet size constraints
-- Convex hull polygon generation for zone boundaries
+### Google Maps
 
-### Haversine Distance
-- Fallback when OSRM is unavailable
-- Calculates straight-line distance between GPS coordinates
+- Distance Matrix API supplies small-zone road costs.
+- Directions API supplies walking-mode route geometry.
+- Encoded polylines are decoded for Leaflet.
+- Segment caches use SHA-1 hashes of endpoint coordinates.
 
-## Route Visualization
+### Haversine
 
-| Marker | Color | Symbol | Description |
-|--------|-------|--------|-------------|
-| Start | 🟢 Green | ▶ | First stop in route |
-| Middle | Zone color | 1,2,3... | Numbered stops |
-| End | 🔴 Red | ◼ | Last stop in route |
+Used for zones larger than 25 shops and as an API fallback.
 
-## API Endpoints
+### Convex Hull
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/` | Main application page |
-| GET | `/api/zones` | Get all saved zones |
-| POST | `/api/optimize` | Calculate optimized route for single zone |
-| POST | `/api/auto-create-zones` | AI auto-create multiple zones with KMeans |
-| POST | `/api/rename-zone` | Rename a zone |
-| POST | `/api/delete-zone` | Delete a specific zone |
-| POST | `/api/clear` | Clear all zones |
+Automatic boundaries use a Graham-scan-style convex hull over assigned shops.
 
-## Auto-Zone Rules
+## Screenshots
 
-For AI auto-zone creation:
+### Route Optimizer
 
-| Total Stops | Min Zones | Max Zones | Example |
-|-------------|-----------|-----------|---------|
-| 230 | 2 | 2 | Zone 1: 108, Zone 2: 122 |
-| 500 | 4 | 5 | ~100-125 stops each |
-| 1000 | 8 | 10 | ~100-125 stops each |
+![SMR Route Optimizer](Assets/smr-route-optimizer.png)
 
-Formula:
-- Min zones = ceil(total_stops / 130)
-- Max zones = floor(total_stops / 100)
+### Automatic Zone Creation
+
+![Automatic zone creation](Assets/ai-auto-zone-creation-KMeans.png)
 
 ## License
 
 Internal use only.
-
-## Screenshots
-
-### Main Interface - Route Optimizer
-![SMR Route Optimizer](Assets/smr-route-optimizer.png)
-
-### AI Auto-Zone Creation with KMeans
-![AI Auto-Zone Creation](Assets/ai-auto-zone-creation-KMeans.png)

@@ -18,3 +18,8 @@ product_sense_public_shops_with_area.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Local secrets
+.env
+.env.*
+!.env.example
