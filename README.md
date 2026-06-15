@@ -1,9 +1,9 @@
 # SMR Route Optimizer
 
-SMR Route Optimizer is a single-file Python web application for creating sales or
-delivery zones and calculating an ordered route through the shops in each zone.
-It serves an interactive Leaflet map, exposes a JSON API, and persists zones and
-route geometry in `zones_routes.json`.
+SMR Route Optimizer is a Python web application for creating sales or delivery
+zones and calculating an ordered route through the shops in each zone. The
+backend exposes a JSON API and serves a separate Leaflet frontend, while zone
+data and route geometry are persisted in `zones_routes.json`.
 
 The current dataset contains 24,724 shops in the `dhk_metro` area.
 
@@ -21,6 +21,19 @@ The current dataset contains 24,724 shops in the `dhk_metro` area.
 - Rename, delete, focus, and clear zone actions
 - Persistent zone data and cached Google Maps route segments
 - Local and local-network access
+
+## Architecture
+
+- `backend/app.py` owns configuration, shop loading, clustering, routing,
+  persistence, HTTP APIs, and static-file delivery.
+- `frontend/index.html` contains the application markup.
+- `frontend/styles.css` contains the page styles.
+- `frontend/app.js` contains map interaction and API client behavior.
+- `smr-po.py` remains a compatibility launcher and calls `backend.app.main()`.
+
+The frontend has no build step. The backend injects shop data and the initial map
+center into `frontend/index.html`, then serves the CSS and JavaScript files as
+static assets.
 
 ## Routing Behavior
 
@@ -98,6 +111,7 @@ Runtime settings are loaded from environment variables and the ignored `.env` fi
 GOOGLE_MAPS_API_KEY=replace-with-your-google-maps-api-key
 GOOGLE_MAPS_TIMEOUT=60
 SMR_PORT=9541
+SMR_OPEN_BROWSER=true
 # SMR_WORKING_DIR=/absolute/path/to/project
 # SMR_DATA_FILE=product_sense_public_shops_with_area.json
 # SMR_OUTPUT_FILE=zones_routes.json
@@ -114,6 +128,13 @@ cd "/home/sajadulakash/Desktop/SMR PO"
 conda activate smrpo
 # Configure .env first if it does not already exist
 python smr-po.py
+```
+
+The compatibility launcher above is recommended. The backend can also be started
+directly with:
+
+```bash
+python -m backend.app
 ```
 
 | Access | URL |
@@ -153,7 +174,15 @@ default browser. Stop it with `Ctrl+C`.
 
 ```text
 SMR PO/
+|-- backend/
+|   |-- __init__.py
+|   `-- app.py
+|-- frontend/
+|   |-- index.html
+|   |-- styles.css
+|   `-- app.js
 |-- smr-po.py
+|-- .env.example
 |-- product_sense_public_shops_with_area.json
 |-- zones_routes.json
 |-- README.md
