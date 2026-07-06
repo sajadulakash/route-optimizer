@@ -247,12 +247,32 @@ latitude or longitude are skipped.
 Automatically created zones may also include `stops` and
 `estimated_distance_km`.
 
+## Market Intelligence SO Planning Integration
+
+The Market Intelligence SO Planning screen can submit a selected thana GeoJSON to this backend. The request remains pending until it is accepted from the old Route Optimizer frontend.
+
+After acceptance, the backend:
+
+1. Selects backend shops contained by the submitted Polygon or MultiPolygon.
+2. Creates compact zones with the existing automatic-zone algorithm.
+3. Optimizes each route with the existing OR-Tools and Google Maps workflow.
+4. Saves a GeoJSON `FeatureCollection` under `data-json/` containing the requested area, zone polygons, optimized route lines, and ordered route-stop points.
+5. Exposes the saved result to Market Intelligence through the returned `result_url`.
+
+Market Intelligence uses `VITE_SMR_API_URL`, defaulting to `http://localhost:9541`.
+
 ## HTTP API
 
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/` | Serve the map |
 | `GET` | `/api/zones` | Return saved zones |
+| `GET` | `/api/planning-requests` | List SO Planning requests, optionally filtered by status and area code |
+| `GET` | `/api/planning-requests/{id}` | Return one planning request and its processing status |
+| `POST` | `/api/planning-requests` | Submit an area GeoJSON for approval |
+| `POST` | `/api/planning-requests/{id}/accept` | Accept and asynchronously process a request |
+| `POST` | `/api/planning-requests/{id}/reject` | Reject a pending request |
+| `GET` | `/data-json/{file}` | Return a saved optimized GeoJSON result |
 | `POST` | `/api/optimize` | Optimize and save one zone |
 | `POST` | `/api/auto-create-zones` | Generate, optimize, and save zones |
 | `POST` | `/api/rename-zone` | Rename a zone by index |

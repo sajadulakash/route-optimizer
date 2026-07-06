@@ -6,9 +6,13 @@ import json
 import os
 import re
 import subprocess
+import threading
+import traceback
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
 
@@ -76,6 +80,36 @@ def load_stops(filepath):
             })
     return stops
 
+def normalize_request_shops(raw_shops):
+    """Normalize shop points supplied in a request body.
+
+    Accepts a list of objects with a latitude ('lat') and a longitude under any
+    of 'lon' / 'lng' / 'long'. Coordinate values may be numbers or strings
+    (e.g. '23.7806 N'). Returns a list of {id, name, address, lat, lon} dicts,
+    silently skipping any entry without a usable coordinate pair.
+    """
+    if not isinstance(raw_shops, list):
+        return []
+
+    normalized = []
+    for index, item in enumerate(raw_shops):
+        if not isinstance(item, dict):
+            continue
+        raw_lat = item.get('lat')
+        raw_lon = item.get('lon', item.get('lng', item.get('long')))
+        lat = raw_lat if isinstance(raw_lat, (int, float)) else parse_coordinate(raw_lat)
+        lon = raw_lon if isinstance(raw_lon, (int, float)) else parse_coordinate(raw_lon)
+        if lat is None or lon is None:
+            continue
+        normalized.append({
+            'id': str(item.get('id') or f'shop-{index + 1}'),
+            'name': item.get('name') or 'Unknown',
+            'address': item.get('address') or '',
+            'lat': float(lat),
+            'lon': float(lon),
+        })
+    return normalized
+
 # ============================================================================
 # Route Optimization
 # ============================================================================
@@ -106,6 +140,9 @@ GOOGLE_MAPS_TIMEOUT = int(os.environ.get("GOOGLE_MAPS_TIMEOUT", "60"))
 # Cache directory for API responses
 CACHE_DIR = os.path.join(WORKING_DIR, 'cache')
 FRONTEND_DIR = os.path.join(BASE_DIR, 'frontend')
+DATA_JSON_DIR = os.path.join(WORKING_DIR, 'data-json')
+PLANNING_REQUESTS_FILE = os.path.join(DATA_JSON_DIR, 'planning-requests.json')
+PLANNING_REQUEST_LOCK = threading.Lock()
 
 def point_in_polygon(lat, lon, polygon):
     """Check if a point is inside a polygon using ray casting algorithm.
@@ -123,6 +160,259 @@ def point_in_polygon(lat, lon, polygon):
         j = i
 
     return inside
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def ensure_data_json_dir():
+    os.makedirs(DATA_JSON_DIR, exist_ok=True)
+
+
+def safe_slug(value):
+    slug = re.sub(r'[^a-z0-9]+', '-', str(value or '').lower()).strip('-')
+    return slug or 'area'
+
+
+def geojson_polygon_rings(feature):
+    if not isinstance(feature, dict) or feature.get('type') != 'Feature':
+        raise ValueError('area must be a GeoJSON Feature')
+    geometry = feature.get('geometry') or {}
+    geometry_type = geometry.get('type')
+    coordinates = geometry.get('coordinates')
+    if geometry_type == 'Polygon':
+        polygons = [coordinates]
+    elif geometry_type == 'MultiPolygon':
+        polygons = coordinates
+    else:
+        raise ValueError('area geometry must be Polygon or MultiPolygon')
+    if not isinstance(polygons, list) or not polygons:
+        raise ValueError('area geometry has no polygon coordinates')
+    normalized = []
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            continue
+        rings = []
+        for ring in polygon:
+            if not isinstance(ring, list) or len(ring) < 3:
+                continue
+            normalized_ring = []
+            for point in ring:
+                if isinstance(point, list) and len(point) >= 2:
+                    normalized_ring.append([float(point[0]), float(point[1])])
+            if len(normalized_ring) >= 3:
+                rings.append(normalized_ring)
+        if rings:
+            normalized.append(rings)
+    if not normalized:
+        raise ValueError('area geometry has no valid polygon rings')
+    return normalized
+
+
+def point_in_geojson_feature(lat, lon, feature):
+    for rings in geojson_polygon_rings(feature):
+        outer = [[point[1], point[0]] for point in rings[0]]
+        if not point_in_polygon(lat, lon, outer):
+            continue
+        holes = [[[point[1], point[0]] for point in ring] for ring in rings[1:]]
+        if not any(point_in_polygon(lat, lon, hole) for hole in holes):
+            return True
+    return False
+
+
+def feature_preview_polygon(feature):
+    exterior_rings = [rings[0] for rings in geojson_polygon_rings(feature)]
+    largest = max(exterior_rings, key=len)
+    return [[point[1], point[0]] for point in largest]
+
+
+def read_planning_requests():
+    ensure_data_json_dir()
+    if not os.path.exists(PLANNING_REQUESTS_FILE):
+        return []
+    try:
+        with open(PLANNING_REQUESTS_FILE, 'r', encoding='utf-8') as file:
+            data = json.load(file)
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def write_planning_requests(requests):
+    ensure_data_json_dir()
+    temp_path = f'{PLANNING_REQUESTS_FILE}.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as file:
+        json.dump(requests, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, PLANNING_REQUESTS_FILE)
+
+
+def planning_request_public_view(request_data, include_area=False):
+    result = {
+        key: value for key, value in request_data.items()
+        if key not in ('area', 'shops')
+    }
+    if include_area:
+        result['area'] = request_data.get('area')
+    return result
+
+
+def get_planning_request(request_id):
+    with PLANNING_REQUEST_LOCK:
+        return next((item for item in read_planning_requests() if item.get('id') == request_id), None)
+
+
+def update_planning_request(request_id, **changes):
+    with PLANNING_REQUEST_LOCK:
+        requests = read_planning_requests()
+        updated = None
+        for item in requests:
+            if item.get('id') == request_id:
+                item.update(changes)
+                item['updated_at'] = utc_now()
+                updated = item.copy()
+                break
+        if updated is None:
+            return None
+        write_planning_requests(requests)
+        return updated
+
+
+def zone_result_geojson(request_data, zones):
+    features = []
+    area = json.loads(json.dumps(request_data['area']))
+    area_properties = dict(area.get('properties') or {})
+    area_properties.update({
+        'feature_kind': 'requested_area',
+        'request_id': request_data['id'],
+        'area_code': request_data.get('area_code', ''),
+        'area_name': request_data.get('area_name', ''),
+    })
+    area['properties'] = area_properties
+    features.append(area)
+    for zone_index, zone in enumerate(zones):
+        zone_id = f"{request_data['id']}-zone-{zone_index + 1}"
+        polygon = zone.get('polygon') or []
+        if polygon:
+            ring = [[point[1], point[0]] for point in polygon]
+            if ring[0] != ring[-1]:
+                ring.append(ring[0])
+            features.append({
+                'type': 'Feature',
+                'id': zone_id,
+                'properties': {
+                    'feature_kind': 'zone', 'request_id': request_data['id'],
+                    'zone_id': zone_id, 'code': zone_id, 'zone_index': zone_index,
+                    'name': zone.get('name', f'Zone {zone_index + 1}'),
+                    'total_stops': zone.get('total_stops', 0),
+                    'total_distance_km': zone.get('total_distance_km', 0),
+                },
+                'geometry': {'type': 'Polygon', 'coordinates': [ring]},
+            })
+        route_points = zone.get('road_geometry') or [
+            [stop['lat'], stop['lon']] for stop in zone.get('route', [])
+        ]
+        if len(route_points) >= 2:
+            features.append({
+                'type': 'Feature',
+                'id': f'{zone_id}-route',
+                'properties': {
+                    'feature_kind': 'optimized_route', 'request_id': request_data['id'],
+                    'zone_id': zone_id, 'name': zone.get('name', f'Zone {zone_index + 1}'),
+                    'total_stops': zone.get('total_stops', 0),
+                    'total_distance_km': zone.get('total_distance_km', 0),
+                },
+                'geometry': {
+                    'type': 'LineString',
+                    'coordinates': [[point[1], point[0]] for point in route_points],
+                },
+            })
+        for stop_index, stop in enumerate(zone.get('route', [])):
+            features.append({
+                'type': 'Feature',
+                'id': f'{zone_id}-stop-{stop_index + 1}',
+                'properties': {
+                    'feature_kind': 'route_stop', 'request_id': request_data['id'],
+                    'zone_id': zone_id, 'sequence': stop_index + 1,
+                    'shop_id': stop.get('id', ''), 'name': stop.get('name', ''),
+                    'address': stop.get('address', ''),
+                },
+                'geometry': {'type': 'Point', 'coordinates': [stop['lon'], stop['lat']]},
+            })
+    return {
+        'type': 'FeatureCollection',
+        'properties': {
+            'request_id': request_data['id'],
+            'area_code': request_data.get('area_code', ''),
+            'area_name': request_data.get('area_name', ''),
+            'generated_at': utc_now(),
+            'zone_count': len(zones),
+            'total_stops': sum(zone.get('total_stops', 0) for zone in zones),
+            'total_distance_km': round(sum(zone.get('total_distance_km', 0) for zone in zones), 2),
+        },
+        'features': features,
+    }
+
+
+def process_planning_request(request_id):
+    request_data = get_planning_request(request_id)
+    if not request_data:
+        return
+    try:
+        # Prefer shop points supplied in the request. Fall back to selecting
+        # from the backend dataset by the submitted area for older callers.
+        selected_stops = normalize_request_shops(request_data.get('shops'))
+        if not selected_stops:
+            selected_stops = [
+                stop for stop in RequestHandler.stops
+                if point_in_geojson_feature(stop['lat'], stop['lon'], request_data['area'])
+            ]
+        if not selected_stops:
+            raise ValueError('No shops were supplied in the request or found inside the submitted area')
+        target_stops = max(1, int(request_data.get('target_stops') or TARGET_STOPS_PER_ZONE))
+        requested_zone_count = request_data.get('num_zones')
+        if requested_zone_count is None:
+            requested_zone_count = max(1, round(len(selected_stops) / target_stops))
+        requested_zone_count = max(1, min(int(requested_zone_count), len(selected_stops), 50))
+        update_planning_request(
+            request_id, status='processing', selected_stop_count=len(selected_stops),
+            zone_count=requested_zone_count, error=None,
+        )
+        auto_zones = auto_create_zones_kmeans(selected_stops, requested_zone_count, target_stops)
+        if not auto_zones:
+            raise ValueError('Unable to create zones for the submitted area')
+        completed_zones = []
+        for zone in auto_zones:
+            optimized, distance, road_geometry = optimize_route_in_zone(
+                zone['stops'], 0, zone['polygon']
+            )
+            zone['route'] = optimized
+            zone['total_distance_km'] = round(distance, 2)
+            zone['road_geometry'] = road_geometry
+            completed_zones.append(zone)
+        with PLANNING_REQUEST_LOCK:
+            RequestHandler.zones_data['zones'].extend(completed_zones)
+            save_zones_to_file(RequestHandler.zones_data)
+        result = zone_result_geojson(request_data, completed_zones)
+        filename = (
+            f"{safe_slug(request_data.get('area_code') or request_data.get('area_name'))}"
+            f"-{request_id[:8]}-optimized.geojson"
+        )
+        ensure_data_json_dir()
+        with open(os.path.join(DATA_JSON_DIR, filename), 'w', encoding='utf-8') as file:
+            json.dump(result, file, ensure_ascii=False, indent=2)
+        update_planning_request(
+            request_id, status='completed', completed_at=utc_now(), result_file=filename,
+            result_url=f'/data-json/{urllib.parse.quote(filename)}',
+            zones_created=len(completed_zones),
+            total_distance_km=result['properties']['total_distance_km'],
+        )
+    except Exception as error:
+        traceback.print_exc()
+        update_planning_request(
+            request_id, status='failed', completed_at=utc_now(), error=str(error)
+        )
+
 
 def get_cache_path(cache_key):
     """Get cache file path for a given key."""
@@ -1392,6 +1682,26 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress logging
 
+    def end_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
+    def read_json_body(self):
+        content_length = int(self.headers.get('Content-Length', '0'))
+        if content_length <= 0:
+            return {}
+        return json.loads(self.rfile.read(content_length).decode('utf-8'))
+
+    def send_json(self, status, data):
+        content = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_content(status, 'application/json; charset=utf-8', content)
+
     def send_content(self, status, content_type, content):
         self.send_response(status)
         self.send_header('Content-type', content_type)
@@ -1400,7 +1710,49 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_GET(self):
-        path = self.path.split('?', 1)[0]
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if path == '/api/planning-requests':
+            requested_status = query.get('status', [None])[0]
+            with PLANNING_REQUEST_LOCK:
+                requests = read_planning_requests()
+            if requested_status:
+                requests = [item for item in requests if item.get('status') == requested_status]
+            requested_area_code = query.get('area_code', [None])[0]
+            if requested_area_code:
+                requests = [item for item in requests if item.get('area_code') == requested_area_code]
+            requests.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+            self.send_json(200, {
+                'requests': [planning_request_public_view(item, include_area=True) for item in requests]
+            })
+            return
+
+        request_match = re.fullmatch(r'/api/planning-requests/([a-f0-9-]+)', path)
+        if request_match:
+            request_data = get_planning_request(request_match.group(1))
+            if not request_data:
+                self.send_json(404, {'success': False, 'error': 'Planning request not found'})
+                return
+            self.send_json(200, {
+                'success': True,
+                'request': planning_request_public_view(request_data, include_area=True),
+            })
+            return
+
+        if path.startswith('/data-json/'):
+            filename = os.path.basename(urllib.parse.unquote(path[len('/data-json/'):]))
+            file_path = os.path.join(DATA_JSON_DIR, filename)
+            if filename and os.path.isfile(file_path):
+                self.send_content(
+                    200,
+                    'application/geo+json; charset=utf-8',
+                    Path(file_path).read_bytes(),
+                )
+            else:
+                self.send_json(404, {'success': False, 'error': 'Result GeoJSON not found'})
+            return
 
         if path == '/api/zones':
             content = json.dumps(RequestHandler.zones_data).encode('utf-8')
@@ -1426,7 +1778,133 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_content(404, 'text/plain; charset=utf-8', b'Not found')
 
     def do_POST(self):
-        if self.path == '/api/optimize':
+        path = urllib.parse.urlparse(self.path).path
+
+        if path == '/api/planning-requests':
+            try:
+                data = self.read_json_body()
+                area = data.get('area')
+                geojson_polygon_rings(area)
+                shops = normalize_request_shops(data.get('shops'))
+                # so_count = number of zones (one route per Sales Officer).
+                # Accept 'so_count' or the legacy 'num_zones' key.
+                so_count = data.get('so_count', data.get('num_zones'))
+                num_zones = int(so_count) if str(so_count or '').strip() else None
+                request_id = str(uuid.uuid4())
+                request_data = {
+                    'id': request_id,
+                    'status': 'pending',
+                    'created_at': utc_now(),
+                    'updated_at': utc_now(),
+                    'source': data.get('source', 'market-intelligence'),
+                    'area_code': str(data.get('area_code') or ''),
+                    'area_name': str(data.get('area_name') or 'Selected area'),
+                    'division_code': str(data.get('division_code') or ''),
+                    'district_code': str(data.get('district_code') or ''),
+                    'target_stops': int(data.get('target_stops') or TARGET_STOPS_PER_ZONE),
+                    'num_zones': num_zones,
+                    'so_count': num_zones,
+                    'shop_count': len(shops),
+                    'preview_polygon': feature_preview_polygon(area),
+                    'area': area,
+                    'shops': shops,
+                }
+                with PLANNING_REQUEST_LOCK:
+                    requests = read_planning_requests()
+                    requests.append(request_data)
+                    write_planning_requests(requests)
+                self.send_json(201, {
+                    'success': True,
+                    'request': planning_request_public_view(request_data, include_area=True),
+                })
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.send_json(400, {'success': False, 'error': str(error)})
+            return
+
+        action_match = re.fullmatch(
+            r'/api/planning-requests/([a-f0-9-]+)/(accept|reject)', path
+        )
+        if action_match:
+            request_id, action = action_match.groups()
+            request_data = get_planning_request(request_id)
+            if not request_data:
+                self.send_json(404, {'success': False, 'error': 'Planning request not found'})
+                return
+            if request_data.get('status') != 'pending':
+                self.send_json(409, {
+                    'success': False,
+                    'error': f"Request is already {request_data.get('status')}",
+                    'request': planning_request_public_view(request_data, include_area=True),
+                })
+                return
+            if action == 'reject':
+                updated = update_planning_request(
+                    request_id, status='rejected', completed_at=utc_now()
+                )
+                self.send_json(200, {
+                    'success': True,
+                    'request': planning_request_public_view(updated, include_area=True),
+                })
+                return
+            updated = update_planning_request(
+                request_id, status='accepted', accepted_at=utc_now(), error=None
+            )
+            worker = threading.Thread(
+                target=process_planning_request,
+                args=(request_id,),
+                daemon=True,
+                name=f'planning-{request_id[:8]}',
+            )
+            worker.start()
+            self.send_json(202, {
+                'success': True,
+                'request': planning_request_public_view(updated, include_area=True),
+            })
+            return
+
+        if path == '/api/blocking/generate':
+            # Synchronous zoning for the Market Intelligence Blocking screen.
+            # Receives {shops:[{id,name,type,lat,lng}], soCount, warehouse, area}
+            # and returns {blocks:[{name, shopIds, centroid:{lat,lng}}]} at once.
+            try:
+                data = self.read_json_body()
+                shops = normalize_request_shops(data.get('shops'))
+                if not shops:
+                    self.send_json(400, {'success': False, 'error': 'No shops supplied'})
+                    return
+                requested = data.get('soCount', data.get('so_count'))
+                if str(requested or '').strip():
+                    num_zones = int(requested)
+                else:
+                    num_zones = max(1, round(len(shops) / TARGET_STOPS_PER_ZONE))
+                num_zones = max(1, min(num_zones, len(shops)))
+
+                auto_zones = auto_create_zones_kmeans(shops, num_zones, TARGET_STOPS_PER_ZONE) or []
+                blocks = []
+                for zone in auto_zones:
+                    zone_stops = zone.get('stops') or []
+                    if not zone_stops:
+                        continue
+                    count = len(zone_stops)
+                    blocks.append({
+                        'name': zone.get('name'),
+                        'shopIds': [stop['id'] for stop in zone_stops],
+                        'centroid': {
+                            'lat': sum(stop['lat'] for stop in zone_stops) / count,
+                            'lng': sum(stop['lon'] for stop in zone_stops) / count,
+                        },
+                    })
+                self.send_json(200, {
+                    'requestId': data.get('requestId'),
+                    'cacheKey': data.get('cacheKey'),
+                    'blocks': blocks,
+                    'meta': {'k': len(blocks), 'soCount': num_zones},
+                })
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.send_json(400, {'success': False, 'error': str(error)})
+            return
+
+        if path == '/api/optimize':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode())
@@ -1465,7 +1943,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(response).encode())
 
-        elif self.path == '/api/auto-create-zones':
+        elif path == '/api/auto-create-zones':
             content_length = int(self.headers['Content-Length'])
             post_data = json.loads(self.rfile.read(content_length))
 
@@ -1540,7 +2018,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     'error': 'Not enough stops for zones'
                 }).encode())
 
-        elif self.path == '/api/rename-zone':
+        elif path == '/api/rename-zone':
             content_length = int(self.headers['Content-Length'])
             post_data = json.loads(self.rfile.read(content_length))
             zone_index = post_data.get('zone_index', -1)
@@ -1562,7 +2040,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({'success': False, 'error': 'Invalid zone index or empty name'}).encode())
 
-        elif self.path == '/api/delete-zone':
+        elif path == '/api/delete-zone':
             content_length = int(self.headers['Content-Length'])
             post_data = json.loads(self.rfile.read(content_length))
             zone_index = post_data.get('zone_index', -1)
@@ -1582,7 +2060,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({'success': False, 'error': 'Invalid zone index'}).encode())
 
-        elif self.path == '/api/clear':
+        elif path == '/api/clear':
             RequestHandler.zones_data = {'zones': []}
             save_zones_to_file(RequestHandler.zones_data)
             self.send_response(200)
@@ -1646,7 +2124,7 @@ def main():
     print(f"\n🌐 Starting server...")
     print(f"   Local:   http://localhost:{PORT}")
     print(f"   Network: http://{local_ip}:{PORT}")
-    server = HTTPServer(('0.0.0.0', PORT), RequestHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
 
     # Open browser
     if os.environ.get('SMR_OPEN_BROWSER', 'true').lower() not in ('0', 'false', 'no'):

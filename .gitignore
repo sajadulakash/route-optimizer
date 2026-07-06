@@ -1,25 +1,23 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
 *.pyc
 
-# Cache
-.cache/
+# Google Maps response cache
 cache/
 
-# Data files
+# Input dataset
 product_sense_public_shops_with_area.json
 
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
+# Generated SO Planning requests and optimized GeoJSON
+data-json/
 
 # Local secrets
 .env
 .env.*
 !.env.example
+
+# Editor
+.vscode/
+
+# External Market Intelligence app (separate project, integration source only)
+market-intelligence/

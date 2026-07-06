@@ -188,6 +188,20 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .save-rename-btn { margin-left: 5px; background: #4caf50; color: white; }
 .zone-name-input { width: calc(100% - 55px); margin: 0; padding: 5px; font-size: 12px; }
 .map-error { padding: 40px; color: #b71c1c; font-weight: bold; }
+.planning-request-item {
+    margin-top: 8px;
+    padding: 10px;
+    border: 1px solid #cfd8dc;
+    border-radius: 6px;
+    background: #f8fbfc;
+}
+.planning-request-title { font-size: 13px; font-weight: bold; color: #263238; }
+.planning-request-meta { margin-top: 4px; font-size: 11px; color: #607d8b; }
+.planning-request-actions { display: flex; gap: 5px; margin-top: 8px; }
+.planning-request-actions button { margin: 0; padding: 7px; font-size: 11px; }
+.request-preview-btn { background: #607d8b; color: white; }
+.request-accept-btn { background: #2e7d32; color: white; }
+.request-reject-btn { background: #c62828; color: white; }
 
 @media (max-width: 800px) {
     #map { width: 100%; height: 60vh; float: none; }

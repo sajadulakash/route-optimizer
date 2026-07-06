@@ -20,6 +20,8 @@ let drawingPreview = null;
 let drawingVertexMarkers = [];
 let isSaving = false;
 let stopRenderTimer = null;
+let planningRequestTimer = null;
+let pendingPlanningRequests = [];
 
 
 function escapeHtml(value) {
@@ -89,6 +91,8 @@ window.initMap = function initMap() {
     map.addListener('click', handleDrawingClick);
     map.addListener('idle', scheduleVisibleStopRender);
     loadExistingZones();
+    loadPlanningRequests();
+    planningRequestTimer = window.setInterval(loadPlanningRequests, 4000);
     setDrawingStatus('Zoom in or draw an area. Visible shops load by viewport.');
     scheduleVisibleStopRender();
 };
@@ -738,10 +742,171 @@ async function autoCreateZones() {
     }
 }
 
+function planningRequestLabel(request) {
+    const location = [request.area_name, request.area_code].filter(Boolean).join(' / ');
+    return location || 'Selected area';
+}
+
+function renderPlanningRequests() {
+    const container = document.getElementById('planningRequestList');
+    if (!container) return;
+    if (!pendingPlanningRequests.length) {
+        container.innerHTML = '<p class="empty-state">No pending requests.</p>';
+        return;
+    }
+    container.innerHTML = pendingPlanningRequests.map(request => `
+        <div class="planning-request-item">
+            <div class="planning-request-title">${escapeHtml(planningRequestLabel(request))}</div>
+            <div class="planning-request-meta">Target: ${escapeHtml(request.target_stops || 100)} stops per zone</div>
+            <div class="planning-request-actions">
+                <button class="request-preview-btn" onclick="previewPlanningRequest('${request.id}')">Preview</button>
+                <button class="request-accept-btn" onclick="acceptPlanningRequest('${request.id}')">Accept</button>
+                <button class="request-reject-btn" onclick="rejectPlanningRequest('${request.id}')">Reject</button>
+            </div>
+        </div>
+    `).join('');
+}
+
+async function loadPlanningRequests() {
+    try {
+        const response = await fetch('/api/planning-requests?status=pending');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        pendingPlanningRequests = data.requests || [];
+        renderPlanningRequests();
+    } catch (error) {
+        console.error('Unable to load planning requests:', error);
+    }
+}
+
+function showPlanningRequestArea(request) {
+    const polygon = request.preview_polygon || [];
+    if (polygon.length < 3) throw new Error('The request has no valid polygon preview');
+    const path = polygon.map(point => ({ lat: point[0], lng: point[1] }));
+
+    // Draw the requested area for map context ONLY. The shops to optimize are
+    // exactly the ones Market Intelligence sent with the request
+    // (request.shop_count) — NOT the backend's local dataset. So we must not run
+    // completeSelection() here, which would re-select local stops inside the
+    // polygon and show a misleading count.
+    clearDrawingDraft();
+    clearCurrentSelection();
+    drawingMode = null;
+    map.setOptions({ draggableCursor: null });
+    setDrawingButtons();
+    currentSelectionOverlay = new google.maps.Polygon({
+        map,
+        paths: path,
+        strokeColor: '#ff9800',
+        strokeOpacity: 1,
+        strokeWeight: 2,
+        fillColor: '#ff9800',
+        fillOpacity: 0.14,
+        clickable: false,
+    });
+
+    const bounds = new google.maps.LatLngBounds();
+    path.forEach(point => bounds.extend(point));
+    if (!bounds.isEmpty()) map.fitBounds(bounds, 40);
+
+    // The manual Zone Setup panel is not used for a planning request; keep it
+    // hidden so its local-selection counts can't be confused with this request.
+    document.getElementById('zoneSetup').classList.add('hidden');
+    const shopCount = request.shop_count != null ? request.shop_count : '—';
+    setDrawingStatus(
+        `SO Planning request loaded: ${planningRequestLabel(request)} — ${shopCount} shops from Market Intelligence`
+    );
+}
+
+function previewPlanningRequest(requestId) {
+    const request = pendingPlanningRequests.find(item => item.id === requestId);
+    if (!request) return;
+    try {
+        showPlanningRequestArea(request);
+    } catch (error) {
+        alert(`Unable to preview request: ${error.message}`);
+    }
+}
+
+async function waitForPlanningRequest(requestId) {
+    while (true) {
+        await new Promise(resolve => window.setTimeout(resolve, 2000));
+        const response = await fetch(`/api/planning-requests/${requestId}`);
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Unable to read request status');
+        const request = data.request;
+        if (request.status === 'completed') return request;
+        if (request.status === 'failed' || request.status === 'rejected') {
+            throw new Error(request.error || `Request ${request.status}`);
+        }
+        document.getElementById('loading').textContent = request.status === 'processing'
+            ? `Creating ${request.zone_count || ''} zones and optimizing paths...`
+            : 'Waiting for route optimization...';
+    }
+}
+
+async function acceptPlanningRequest(requestId) {
+    const request = pendingPlanningRequests.find(item => item.id === requestId);
+    if (!request) return;
+    if (!confirm(`Accept SO Planning request for ${planningRequestLabel(request)}?`)) return;
+    try {
+        showPlanningRequestArea(request);
+        const loading = document.getElementById('loading');
+        loading.textContent = 'Submitting accepted area for optimization...';
+        loading.style.display = 'block';
+        const response = await fetch(`/api/planning-requests/${requestId}/accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Unable to accept request');
+        pendingPlanningRequests = pendingPlanningRequests.filter(item => item.id !== requestId);
+        renderPlanningRequests();
+        const completed = await waitForPlanningRequest(requestId);
+        await loadExistingZones();
+        clearCurrentSelection();
+        selectedStops = [];
+        document.getElementById('zoneSetup').classList.add('hidden');
+        setStep(1);
+        setDrawingStatus(`Completed SO Planning request for ${planningRequestLabel(completed)}.`);
+        alert(`Optimization completed.
+${completed.zones_created} zones created.
+Result: ${completed.result_file}`);
+    } catch (error) {
+        alert(`Planning request failed: ${error.message}`);
+    } finally {
+        const loading = document.getElementById('loading');
+        loading.textContent = 'Optimizing route...';
+        loading.style.display = 'none';
+        loadPlanningRequests();
+    }
+}
+
+async function rejectPlanningRequest(requestId) {
+    const request = pendingPlanningRequests.find(item => item.id === requestId);
+    if (!request || !confirm(`Reject request for ${planningRequestLabel(request)}?`)) return;
+    try {
+        const response = await fetch(`/api/planning-requests/${requestId}/reject`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Unable to reject request');
+        pendingPlanningRequests = pendingPlanningRequests.filter(item => item.id !== requestId);
+        renderPlanningRequests();
+    } catch (error) {
+        alert(`Unable to reject request: ${error.message}`);
+    }
+}
+
 async function loadExistingZones() {
     try {
         const response = await fetch('/api/zones');
         const data = await response.json();
+        routeLayers.forEach(removeRouteLayer);
+        routeLayers = [];
         zones = data.zones || [];
         zones.forEach((zone, index) => drawRoute(zone, index));
         updateZoneList();
